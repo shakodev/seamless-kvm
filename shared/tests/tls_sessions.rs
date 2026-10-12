@@ -145,3 +145,17 @@ async fn cancellation_does_not_discard_partial_frame() {
     peer.write_all(&bytes[9..len]).await.unwrap();
     assert!(conn.incoming.recv().await.unwrap().unwrap() == Message::Heartbeat(99));
 }
+
+#[tokio::test]
+async fn partial_write_timeout_permanently_disables_writer() {
+    let (host, _peer) = tokio::io::duplex(4);
+    let mut conn = Connection::new(host);
+    let error = conn.send(Message::Heartbeat(9)).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    // A ReleaseAll after a partial frame would corrupt the remaining stream.
+    let error = timeout(Duration::from_millis(20), conn.send(Message::ReleaseAll))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+}

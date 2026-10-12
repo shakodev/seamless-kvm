@@ -62,6 +62,7 @@ pub struct Connection<S> {
     pub incoming: mpsc::Receiver<io::Result<Message>>,
     writer: WriteHalf<S>,
     reader: JoinHandle<()>,
+    write_failed: bool,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Connection<S> {
     pub fn new(stream: S) -> Self {
@@ -80,12 +81,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Connection<S> {
             incoming,
             writer,
             reader,
+            write_failed: false,
         }
     }
     pub async fn send(&mut self, m: Message) -> io::Result<()> {
-        timeout(WRITE_TIMEOUT, write_message(&mut self.writer, m))
+        if self.write_failed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "writer already failed",
+            ));
+        }
+        let result = timeout(WRITE_TIMEOUT, write_message(&mut self.writer, m))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))?
+            .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout")));
+        if result.is_err() {
+            self.write_failed = true;
+        }
+        result
     }
 }
 impl<S> Drop for Connection<S> {

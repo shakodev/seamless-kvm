@@ -22,6 +22,7 @@ pub struct Bridge {
     pub session: AtomicU64,
     pub worker_tick: AtomicU64,
     pub stop: AtomicBool,
+    pub clip_owned: AtomicBool,
     origin: Instant,
 }
 impl Bridge {
@@ -30,6 +31,7 @@ impl Bridge {
             session: AtomicU64::new(0),
             worker_tick: AtomicU64::new(0),
             stop: AtomicBool::new(false),
+            clip_owned: AtomicBool::new(false),
             origin: Instant::now(),
         }
     }
@@ -170,6 +172,10 @@ mod tests {
     }
     #[test]
     fn ready_lease_and_guard_fail_closed() {
+        let mut expired = Bridge::new();
+        expired.origin = Instant::now() - Duration::from_secs(1);
+        expired.session.store(1, Ordering::Release);
+        assert!(!expired.healthy());
         let b = Arc::new(Bridge::new());
         assert!(!b.healthy());
         b.session.store(1, Ordering::Release);

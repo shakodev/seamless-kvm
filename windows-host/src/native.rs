@@ -9,7 +9,7 @@ use std::{
     cell::RefCell,
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
-    sync::{atomic::Ordering, mpsc, Arc},
+    sync::{atomic::Ordering, mpsc, Arc, OnceLock},
     thread,
 };
 use tokio::sync::mpsc::Sender;
@@ -47,8 +47,24 @@ struct Context {
     pending_edge: Option<POINT>,
     heartbeat: HANDLE,
     revoke: HANDLE,
+    clip: HANDLE,
+    last_pump_beat: u64,
 }
 thread_local! {static CTX:RefCell<Option<Context>>=const{RefCell::new(None)};}
+static ACTIVE_BRIDGE: OnceLock<Arc<Bridge>> = OnceLock::new();
+fn fail_open() -> bool {
+    // A reentrant physical callback must revoke ownership: otherwise its local
+    // down could be followed by a remotely suppressed up and stick Windows.
+    if let Some(bridge) = ACTIVE_BRIDGE.get() {
+        bridge.session.store(0, Ordering::Release);
+        if bridge.clip_owned.load(Ordering::Acquire) {
+            unsafe {
+                ClipCursor(null());
+            }
+        }
+    }
+    false
+}
 
 impl Context {
     fn send(&mut self, message: Message) -> bool {
@@ -71,6 +87,19 @@ impl Context {
         }
     }
     fn sync_session(&mut self) {
+        let now = self.bridge.now();
+        if now.saturating_sub(self.last_pump_beat) >= 100 {
+            // Polling timeout zero never waits. Check revocation before a stalled
+            // pump can resume suppressing input, even if WM_TIMER was starved.
+            unsafe {
+                if WaitForSingleObject(self.revoke, 0) == WAIT_OBJECT_0 {
+                    self.bridge.session.store(0, Ordering::Release);
+                    self.bridge.stop.store(true, Ordering::Release);
+                }
+                SetEvent(self.heartbeat);
+            }
+            self.last_pump_beat = now;
+        }
         let mut session = self.bridge.session.load(Ordering::Acquire);
         let healthy = self.bridge.healthy();
         if session != 0 && !healthy {
@@ -99,7 +128,7 @@ impl Context {
         // SAFETY: NULL releases the global confinement; all coordinates are
         // validated monitor coordinates. Never confine unless ClipCursor succeeds.
         unsafe {
-            ClipCursor(null());
+            self.release_clip();
             if was_remote {
                 let mut p: POINT = zeroed();
                 GetCursorPos(&mut p);
@@ -121,14 +150,15 @@ impl Context {
             self.quarantined_buttons = self.buttons;
         }
     }
-    fn timer(&mut self) {
-        unsafe {
-            if WaitForSingleObject(self.revoke, 0) == WAIT_OBJECT_0 {
-                self.bridge.session.store(0, Ordering::Release);
-                self.bridge.stop.store(true, Ordering::Release);
+    fn release_clip(&self) {
+        if self.bridge.clip_owned.swap(false, Ordering::AcqRel) {
+            unsafe {
+                ClipCursor(null());
+                ResetEvent(self.clip);
             }
-            SetEvent(self.heartbeat);
         }
+    }
+    fn timer(&mut self) {
         self.sync_session();
         while let Ok(Command::Return { session, epoch, y }) = self.commands.try_recv() {
             if session == self.session && self.switch.return_local(epoch) {
@@ -137,7 +167,7 @@ impl Context {
                 self.quarantined_keys = std::array::from_fn(|i| self.keys[i].down);
                 self.quarantined_buttons = self.buttons;
                 unsafe {
-                    ClipCursor(null());
+                    self.release_clip();
                     SetCursorPos(self.bounds.right() - 2, self.bounds.denormalize_y(y));
                 }
                 self.send(Message::ReleaseAll);
@@ -180,6 +210,12 @@ impl Context {
                 right: self.bounds.right(),
                 bottom: p.y + 1,
             };
+            // Mark ownership before confinement so the helper also covers a
+            // crash between ClipCursor and the next instruction.
+            self.bridge.clip_owned.store(true, Ordering::Release);
+            unsafe {
+                SetEvent(self.clip);
+            }
             if unsafe { ClipCursor(&clip) } == 0 {
                 self.restore(None);
                 return;
@@ -399,7 +435,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w: WPARAM, l: LPARAM) -> LRES
                             )
                         })
                     })
-                    .unwrap_or(false)
+                    .unwrap_or_else(fail_open)
             });
             if suppressed {
                 return 1;
@@ -417,7 +453,7 @@ unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
                 s.try_borrow_mut()
                     .ok()
                     .and_then(|mut s| s.as_mut().map(|c| c.mouse(w as u32, m.mouseData, m.pt)))
-                    .unwrap_or(false)
+                    .unwrap_or_else(fail_open)
             });
             if suppressed {
                 return 1;
@@ -476,6 +512,8 @@ struct Resources {
     bridge: Arc<Bridge>,
     heartbeat: Handle,
     revoke: Handle,
+    clip: Handle,
+    _instance: Handle,
 }
 struct Handle(HANDLE);
 impl Drop for Handle {
@@ -493,7 +531,12 @@ fn event_name(pid: u32, suffix: &str) -> Vec<u16> {
         .collect()
 }
 unsafe fn create_event(pid: u32, suffix: &str) -> Result<Handle> {
-    let handle = CreateEventW(null(), 0, 0, event_name(pid, suffix).as_ptr());
+    let handle = CreateEventW(
+        null(),
+        (suffix == "clip") as i32,
+        0,
+        event_name(pid, suffix).as_ptr(),
+    );
     ensure!(!handle.is_null(), "watchdog event creation failed");
     Ok(Handle(handle))
 }
@@ -502,7 +545,10 @@ impl Drop for Resources {
         self.bridge.session.store(0, Ordering::Release);
         self.bridge.stop.store(true, Ordering::Release);
         unsafe {
-            ClipCursor(null());
+            if self.bridge.clip_owned.swap(false, Ordering::AcqRel) {
+                ClipCursor(null());
+                ResetEvent(self.clip.0);
+            }
             if !self.keyboard.is_null() {
                 UnhookWindowsHookEx(self.keyboard);
             }
@@ -527,6 +573,10 @@ pub fn start(
     commands: mpsc::Receiver<Command>,
 ) -> Result<thread::JoinHandle<()>> {
     let (started, ready) = mpsc::sync_channel(1);
+    ensure!(
+        ACTIVE_BRIDGE.set(bridge.clone()).is_ok(),
+        "input subsystem already initialized"
+    );
     let input = thread::Builder::new()
         .name("win32-input".into())
         .spawn(move || {
@@ -561,6 +611,12 @@ unsafe fn setup(
     tx: Sender<InputPacket>,
     commands: mpsc::Receiver<Command>,
 ) -> Result<Resources> {
+    let instance_name: Vec<u16> = "Local\\SeamlessKVMHost\0".encode_utf16().collect();
+    let instance_guard = Handle(CreateMutexW(null(), 0, instance_name.as_ptr()));
+    ensure!(
+        !instance_guard.0.is_null() && GetLastError() != ERROR_ALREADY_EXISTS,
+        "another host or native diagnostic is running"
+    );
     ensure!(
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0,
         "could not enable physical-pixel DPI awareness"
@@ -591,6 +647,7 @@ unsafe fn setup(
     let heartbeat = create_event(pid, "heartbeat")?;
     let revoke = create_event(pid, "revoke")?;
     let ready = create_event(pid, "ready")?;
+    let clip = create_event(pid, "clip")?;
     SetEvent(heartbeat.0);
     // Detached helper survives a host crash or stalled message pump.
     use std::os::windows::process::CommandExt;
@@ -611,6 +668,8 @@ unsafe fn setup(
         bridge: bridge.clone(),
         heartbeat,
         revoke,
+        clip,
+        _instance: instance_guard,
     };
     let instance = GetModuleHandleW(null());
     let name: Vec<u16> = "SeamlessKVMInput\0".encode_utf16().collect();
@@ -641,6 +700,22 @@ unsafe fn setup(
     ensure!(!resources.window.is_null(), "input window creation failed");
     let mut last_local: POINT = zeroed();
     GetCursorPos(&mut last_local);
+    // Capture physical holds that predate hook installation, excluding generic
+    // modifier aliases and mouse virtual keys (tracked separately).
+    let mut keys = [Key::default(); 256];
+    for vk in 8..255 {
+        if matches!(vk, 0x10..=0x12) {
+            continue;
+        }
+        let scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
+        keys[vk as usize] = Key {
+            down: GetAsyncKeyState(vk as i32) < 0,
+            scan: (scan & 0xff) as u16,
+            extended: (scan >> 8) == 0xe0,
+        };
+    }
+    let buttons = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+        .map(|vk| GetAsyncKeyState(vk as i32) < 0);
     CTX.with(|s| {
         *s.borrow_mut() = Some(Context {
             bounds,
@@ -649,14 +724,16 @@ unsafe fn setup(
             commands,
             session: 0,
             switch: SwitchState::default(),
-            keys: [Key::default(); 256],
-            buttons: [false; 5],
+            keys,
+            buttons,
             quarantined_keys: [false; 256],
             quarantined_buttons: [false; 5],
             last_local,
             pending_edge: None,
             heartbeat: resources.heartbeat.0,
             revoke: resources.revoke.0,
+            clip: resources.clip.0,
+            last_pump_beat: 0,
         })
     });
     let device = RAWINPUTDEVICE {
@@ -686,7 +763,6 @@ pub fn watchdog(pid: u32) -> Result<()> {
     unsafe {
         let process = Handle(OpenProcess(PROCESS_SYNCHRONIZE, 0, pid));
         if process.0.is_null() {
-            ClipCursor(null());
             bail!("could not open parent process");
         }
         let open = |suffix: &str| -> Result<Handle> {
@@ -701,20 +777,27 @@ pub fn watchdog(pid: u32) -> Result<()> {
         let heartbeat = open("heartbeat")?;
         let revoke = open("revoke")?;
         let ready = open("ready")?;
+        let clip = open("clip")?;
         SetEvent(ready.0);
         let handles = [process.0, heartbeat.0];
         loop {
             match WaitForMultipleObjects(2, handles.as_ptr(), 0, 1000) {
                 WAIT_OBJECT_0 => {
-                    ClipCursor(null());
+                    if WaitForSingleObject(clip.0, 0) == WAIT_OBJECT_0 {
+                        ClipCursor(null());
+                    }
                     break;
                 }
                 n if n == WAIT_OBJECT_0 + 1 => {}
                 _ => {
                     SetEvent(revoke.0);
-                    ClipCursor(null());
+                    if WaitForSingleObject(clip.0, 0) == WAIT_OBJECT_0 {
+                        ClipCursor(null());
+                    }
                     WaitForSingleObject(process.0, INFINITE);
-                    ClipCursor(null());
+                    if WaitForSingleObject(clip.0, 0) == WAIT_OBJECT_0 {
+                        ClipCursor(null());
+                    }
                     break;
                 }
             }
