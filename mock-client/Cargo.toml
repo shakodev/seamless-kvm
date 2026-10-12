@@ -1,0 +1,12 @@
+[package]
+name = "mock-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shared = { path = "../shared" }
+anyhow.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
