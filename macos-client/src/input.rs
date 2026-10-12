@@ -61,7 +61,7 @@ pub struct Input<I: Injector> {
     pub x: f64,
     pub y: f64,
     keys: [bool; 128],
-    physical_keys: [Option<u16>; 256],
+    physical_keys: [Option<u16>; 512],
     buttons: [bool; 5],
     clicks: [i64; 5],
     last_click: [Option<(Instant, f64, f64)>; 5],
@@ -79,7 +79,7 @@ impl<I: Injector> Input<I> {
             x: f64::from(display.bounds.left),
             y: f64::from(display.bounds.top),
             keys: [false; 128],
-            physical_keys: [None; 256],
+            physical_keys: [None; 512],
             buttons: [false; 5],
             clicks: [0; 5],
             last_click: [None; 5],
@@ -210,20 +210,15 @@ impl<I: Injector> Input<I> {
                 down,
             } => {
                 if let Some(code) = keyboard::translate(vk, scan, extended, self.win_to_command) {
-                    // Distinguish generic left/right Windows modifiers and keep
-                    // aliases (e.g. PrintScreen/F13) held until both are released.
-                    let slot = usize::from(match code {
-                        56 => 0xa0,
-                        60 => 0xa1,
-                        59 => 0xa2,
-                        62 => 0xa3,
-                        58 => 0xa4,
-                        61 => 0xa5,
-                        55 => 0x5b,
-                        54 => 0x5c,
-                        _ => vk,
-                    });
-                    ensure!(slot < 256, "invalid virtual key");
+                    // Track physical positions even if NumLock/layout changes
+                    // the virtual key before release. Pause shares NumLock's
+                    // scan, and synthetic special keys can have scan=0.
+                    ensure!(vk < 256, "invalid virtual key");
+                    let slot = if scan == 0 || scan >= 128 || vk == 0x13 {
+                        256 + usize::from(vk)
+                    } else {
+                        usize::from(scan) + if extended { 128 } else { 0 }
+                    };
                     let held = self.keys[usize::from(code)];
                     if down {
                         ensure!(
@@ -653,6 +648,36 @@ pub mod tests {
             i.injector.0.last(),
             Some(Event::Key {
                 code: 105,
+                down: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn virtual_key_change_does_not_strand_a_physical_key() {
+        let mut i = Input::new(Recording::default(), display(), 1.0, true);
+        i.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
+        i.apply(Message::Key {
+            vk: 0x68,
+            scan: 0x48,
+            extended: false,
+            down: true,
+        })
+        .unwrap();
+        // Windows reports keypad Up rather than keypad 8 with NumLock off.
+        i.apply(Message::Key {
+            vk: 0x26,
+            scan: 0x48,
+            extended: false,
+            down: false,
+        })
+        .unwrap();
+        assert_eq!(i.held_count(), 0);
+        assert!(matches!(
+            i.injector.0.last(),
+            Some(Event::Key {
+                code: 91,
                 down: false,
                 ..
             })

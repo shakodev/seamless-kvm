@@ -7,12 +7,7 @@ use crate::{
 };
 use anyhow::{ensure, Context, Result};
 use shared::Bounds;
-use std::{
-    ffi::c_void,
-    ptr,
-    sync::Arc,
-    thread::{self, JoinHandle},
-};
+use std::{ffi::c_void, ptr, sync::Arc, thread};
 
 type Ref = *const c_void;
 type MutRef = *mut c_void;
@@ -35,6 +30,9 @@ struct Rect {
     size: Size,
 }
 type DisplayCallback = unsafe extern "C" fn(u32, u32, MutRef);
+extern "C" {
+    fn pthread_main_np() -> i32;
+}
 #[repr(C)]
 struct TimerContext {
     version: isize,
@@ -318,16 +316,16 @@ impl Injector for Quartz {
 }
 
 unsafe extern "C" fn display_changed(_: u32, _: u32, context: MutRef) {
-    // SAFETY: worker holds this Arc until after callback unregistration on the
-    // same run-loop thread; callback never stores the borrowed pointer.
+    // SAFETY: main holds this Arc through run-loop teardown and callback
+    // unregistration; callback never stores the borrowed pointer.
     unsafe {
         (&*context.cast::<DisplayChanges>()).mark();
     }
 }
 unsafe extern "C" fn keep_alive(_: MutRef, context: MutRef) {
-    // SAFETY: Startup lives on the worker stack until timer invalidation after
+    // SAFETY: Startup lives on the main stack until timer invalidation after
     // CFRunLoopRun returns. Readiness is sent inside an active run loop, so an
-    // immediate Drop cannot race CFRunLoopStop against starting CFRunLoopRun.
+    // immediate worker exit cannot stop the loop before CFRunLoopRun starts.
     unsafe {
         let startup = &mut *context.cast::<Startup>();
         if let Some(ready) = startup.ready.take() {
@@ -339,92 +337,89 @@ unsafe extern "C" fn keep_alive(_: MutRef, context: MutRef) {
     }
 }
 
-/// Dedicated CFRunLoop delivers display notifications while Tokio handles I/O.
-/// A timer in the distant future keeps the run loop alive without polling.
-pub struct DisplayWatcher {
-    run_loop: usize,
-    worker: Option<JoinHandle<()>>,
-}
-impl DisplayWatcher {
-    pub fn start(changes: Arc<DisplayChanges>) -> Result<Self> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
-            .name("display-notifications".into())
-            .spawn(move || {
-                // SAFETY: registration and removal happen on this run-loop thread;
-                // Arc stays live throughout CFRunLoopRun. Retained run loop is
-                // released by the owner only after this thread has joined.
-                unsafe {
-                    let context = Arc::as_ptr(&changes).cast_mut().cast::<c_void>();
-                    let run_loop = CFRunLoopGetCurrent();
-                    let mut startup = Startup {
-                        ready: Some(tx.clone()),
-                        run_loop,
-                        delivered: false,
-                    };
-                    let mut timer_context = TimerContext {
-                        version: 0,
-                        info: (&mut startup as *mut Startup).cast(),
-                        retain: ptr::null(),
-                        release: ptr::null(),
-                        copy_description: ptr::null(),
-                    };
-                    let timer = match Owned::new(CFRunLoopTimerCreate(
-                        ptr::null(),
-                        0.0,
-                        1e12,
-                        0,
-                        0,
-                        keep_alive,
-                        (&mut timer_context as *mut TimerContext).cast(),
-                    )) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            return;
-                        }
-                    };
-                    if CGDisplayRegisterReconfigurationCallback(display_changed, context) != 0 {
-                        let _ = tx.send(Err(anyhow::anyhow!(
-                            "could not register display notifications"
-                        )));
-                        return;
-                    }
-                    CFRunLoopAddTimer(run_loop, timer.0, kCFRunLoopDefaultMode);
-                    CFRetain(run_loop);
-                    CFRunLoopRun();
-                    CGDisplayRemoveReconfigurationCallback(display_changed, context);
-                    CFRunLoopTimerInvalidate(timer.0);
-                    if !startup.delivered {
-                        CFRelease(run_loop);
-                    }
-                }
-            })?;
-        match rx.recv().context("display worker stopped")? {
-            Ok(run_loop) => Ok(Self {
-                run_loop,
-                worker: Some(worker),
-            }),
-            Err(e) => {
-                let _ = worker.join();
-                Err(e)
-            }
+struct Registration(MutRef);
+impl Drop for Registration {
+    fn drop(&mut self) {
+        // SAFETY: callback context remains live until after this registration.
+        unsafe {
+            CGDisplayRemoveReconfigurationCallback(display_changed, self.0);
         }
     }
 }
-impl Drop for DisplayWatcher {
+struct Timer(Owned);
+impl Drop for Timer {
     fn drop(&mut self) {
-        // SAFETY: retained CFRunLoop reference remains valid through the join;
-        // CFRunLoopStop is callable from another thread.
+        // SAFETY: invalidation removes the timer before its stack context dies.
         unsafe {
-            CFRunLoopStop(self.run_loop as MutRef);
+            CFRunLoopTimerInvalidate(self.0 .0);
         }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        unsafe {
-            CFRelease(self.run_loop as Ref);
-        }
+    }
+}
+
+/// Pump Quartz notifications on the process main thread; Tokio and input posting
+/// run on one worker. The startup timer fires once, then sleeps without polling.
+pub fn run_main_loop<F>(changes: Arc<DisplayChanges>, work: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    // SAFETY: this is called from main, not a Tokio worker. Public display access
+    // establishes the process WindowServer connection before registration.
+    unsafe {
+        ensure!(
+            pthread_main_np() != 0,
+            "Quartz run loop requires the main thread"
+        );
+        ensure!(CGMainDisplayID() != 0, "interactive macOS desktop required");
+        let run_loop = CFRunLoopGetCurrent();
+        let _retained_loop = Owned::new(CFRetain(run_loop).cast_mut())?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut startup = Startup {
+            ready: Some(tx),
+            run_loop,
+            delivered: false,
+        };
+        let mut timer_context = TimerContext {
+            version: 0,
+            info: (&mut startup as *mut Startup).cast(),
+            retain: ptr::null(),
+            release: ptr::null(),
+            copy_description: ptr::null(),
+        };
+        let timer = Timer(Owned::new(CFRunLoopTimerCreate(
+            ptr::null(),
+            0.0,
+            1e12,
+            0,
+            0,
+            keep_alive,
+            (&mut timer_context as *mut TimerContext).cast(),
+        ))?);
+        let context = Arc::as_ptr(&changes).cast_mut().cast::<c_void>();
+        ensure!(
+            CGDisplayRegisterReconfigurationCallback(display_changed, context) == 0,
+            "could not register display notifications"
+        );
+        let _registration = Registration(context);
+        let worker = thread::Builder::new()
+            .name("network-input".into())
+            .spawn(move || {
+                // Timer sends readiness while CFRunLoopRun is already active. Stop
+                // therefore cannot race ahead of starting the main run loop.
+                let active_loop = rx
+                    .recv()
+                    .context("main run loop stopped before startup")??;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                CFRunLoopStop(active_loop as MutRef);
+                match result {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            })?;
+        CFRunLoopAddTimer(run_loop, timer.0 .0, kCFRunLoopDefaultMode);
+        CFRunLoopRun();
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("network/input worker panicked"))?
     }
 }
 
@@ -436,6 +431,5 @@ mod tests {
         super::trusted(false).unwrap();
         assert!(!super::displays().unwrap().is_empty());
         let _source = super::Quartz::new().unwrap();
-        let _watcher = super::DisplayWatcher::start(std::sync::Arc::default()).unwrap();
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     input::{select_display, Input},
-    native::{self, DisplayWatcher, Quartz},
+    native::{self, Quartz},
     session::{self, DisplayChanges},
 };
 use anyhow::{ensure, Result};
@@ -25,7 +25,7 @@ async fn shutdown() -> Result<()> {
     Ok(())
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(changes: Arc<DisplayChanges>) -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("displays") {
         for d in native::displays()? {
@@ -50,8 +50,6 @@ pub async fn run() -> Result<()> {
     let config: Config = shared::config::load(&args[if check { 2 } else { 1 }])?;
     config.validate()?;
     native::trusted(true)?;
-    let changes = Arc::new(DisplayChanges::default());
-    let _watcher = DisplayWatcher::start(changes.clone())?;
     if check {
         let display = select_display(&native::displays()?, config.display_id)
             .ok_or_else(|| anyhow::anyhow!("no usable main display"))?;
