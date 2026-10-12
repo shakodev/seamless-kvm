@@ -5,14 +5,32 @@ pub const CONTROL: u64 = 1 << 18;
 pub const OPTION: u64 = 1 << 19;
 pub const COMMAND: u64 = 1 << 20;
 pub const CAPS: u64 = 1 << 16;
+pub const LEFT_COMMAND: u64 = COMMAND | 0x08;
+pub const RIGHT_SHIFT: u64 = SHIFT | 0x04;
 
 pub fn modifier(code: u16) -> u64 {
     match code {
-        56 | 60 => SHIFT,
-        59 | 62 => CONTROL,
-        58 | 61 => OPTION,
-        54 | 55 => COMMAND,
+        // Device-side flags preserve independent left/right transitions, even
+        // when the other side remains down (IOKit/hidsystem/IOLLEvent.h).
+        56 => SHIFT | 0x02,
+        60 => RIGHT_SHIFT,
+        59 => CONTROL | 0x01,
+        62 => CONTROL | 0x2000,
+        58 => OPTION | 0x20,
+        61 => OPTION | 0x40,
+        54 => COMMAND | 0x10,
+        55 => LEFT_COMMAND,
         _ => 0,
+    }
+}
+
+pub fn event_flags(code: u16, modifiers: u64) -> u64 {
+    // NSEvent's numeric-pad flag also identifies arrow keys. Do not carry it
+    // onto unrelated keyboard or mouse events.
+    if matches!(code, 65 | 67 | 69 | 71 | 75 | 76 | 78 | 81..=89 | 91 | 92 | 123..=126) {
+        modifiers | (1 << 21)
+    } else {
+        modifiers
     }
 }
 
@@ -24,6 +42,7 @@ pub fn translate(vk: u16, scan: u16, extended: bool, win_to_command: bool) -> Op
         0x2c => return Some(105),
         0x5b => return win_to_command.then_some(55),
         0x5c => return win_to_command.then_some(54),
+        0x7c..=0x83 => return Some([105, 107, 113, 106, 64, 79, 80, 90][usize::from(vk - 0x7c)]), // F13..F20
         _ => {}
     }
     if extended {

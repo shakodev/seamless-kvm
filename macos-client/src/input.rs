@@ -61,6 +61,7 @@ pub struct Input<I: Injector> {
     pub x: f64,
     pub y: f64,
     keys: [bool; 128],
+    physical_keys: [Option<u16>; 256],
     buttons: [bool; 5],
     clicks: [i64; 5],
     last_click: [Option<(Instant, f64, f64)>; 5],
@@ -78,6 +79,7 @@ impl<I: Injector> Input<I> {
             x: f64::from(display.bounds.left),
             y: f64::from(display.bounds.top),
             keys: [false; 128],
+            physical_keys: [None; 256],
             buttons: [false; 5],
             clicks: [0; 5],
             last_click: [None; 5],
@@ -88,14 +90,12 @@ impl<I: Injector> Input<I> {
         }
     }
     fn flags(&self) -> u64 {
-        self.keys
-            .iter()
-            .enumerate()
-            .filter(|(_, held)| **held)
-            .fold(
-                if self.caps { keyboard::CAPS } else { 0 },
-                |f, (code, _)| f | keyboard::modifier(code as u16),
-            )
+        [54u16, 55, 56, 60, 59, 62, 58, 61]
+            .into_iter()
+            .filter(|code| self.keys[usize::from(*code)])
+            .fold(if self.caps { keyboard::CAPS } else { 0 }, |f, code| {
+                f | keyboard::modifier(code)
+            })
     }
     pub fn held_count(&self) -> usize {
         self.keys.iter().filter(|v| **v).count() + self.buttons.iter().filter(|v| **v).count()
@@ -103,6 +103,7 @@ impl<I: Injector> Input<I> {
     /// Best effort through all releases, even if one native allocation fails.
     pub fn release(&mut self) -> Result<()> {
         self.epoch = None;
+        self.physical_keys.fill(None);
         let mut first_error = None;
         for modifiers in [false, true] {
             for code in 0..128 {
@@ -115,7 +116,7 @@ impl<I: Injector> Input<I> {
                         code: code as u16,
                         down: false,
                         repeat: false,
-                        flags: self.flags(),
+                        flags: keyboard::event_flags(code as u16, self.flags()),
                     };
                     if let Err(e) = self.injector.post(event) {
                         first_error.get_or_insert(e);
@@ -209,9 +210,40 @@ impl<I: Injector> Input<I> {
                 down,
             } => {
                 if let Some(code) = keyboard::translate(vk, scan, extended, self.win_to_command) {
+                    // Distinguish generic left/right Windows modifiers and keep
+                    // aliases (e.g. PrintScreen/F13) held until both are released.
+                    let slot = usize::from(match code {
+                        56 => 0xa0,
+                        60 => 0xa1,
+                        59 => 0xa2,
+                        62 => 0xa3,
+                        58 => 0xa4,
+                        61 => 0xa5,
+                        55 => 0x5b,
+                        54 => 0x5c,
+                        _ => vk,
+                    });
+                    ensure!(slot < 256, "invalid virtual key");
                     let held = self.keys[usize::from(code)];
-                    if !down && !held {
-                        return Ok(None);
+                    if down {
+                        ensure!(
+                            self.physical_keys[slot].is_none_or(|old| old == code),
+                            "key identity changed while held"
+                        );
+                        if self.physical_keys[slot].is_none() {
+                            self.physical_keys[slot] = Some(code);
+                            if held {
+                                return Ok(None);
+                            }
+                        }
+                    } else {
+                        if self.physical_keys[slot] != Some(code) {
+                            return Ok(None);
+                        }
+                        self.physical_keys[slot] = None;
+                        if self.physical_keys.contains(&Some(code)) {
+                            return Ok(None);
+                        }
                     }
                     // Modifier autorepeats would create spurious flagsChanged events.
                     if held && down && (keyboard::modifier(code) != 0 || code == 57) {
@@ -225,7 +257,7 @@ impl<I: Injector> Input<I> {
                         code,
                         down,
                         repeat: down && held,
-                        flags: self.flags(),
+                        flags: keyboard::event_flags(code, self.flags()),
                     })?;
                 }
             }
@@ -343,7 +375,7 @@ pub mod tests {
             i.injector.0.last(),
             Some(Event::Motion {
                 drag: Some(0),
-                flags: keyboard::COMMAND,
+                flags: keyboard::LEFT_COMMAND,
                 ..
             })
         ));
@@ -356,7 +388,7 @@ pub mod tests {
             Event::Key {
                 code: 0,
                 down: false,
-                flags: keyboard::COMMAND,
+                flags: keyboard::LEFT_COMMAND,
                 ..
             }
         ));
@@ -395,7 +427,7 @@ pub mod tests {
         assert!(matches!(
             i.injector.0.last(),
             Some(Event::Key {
-                flags: keyboard::SHIFT,
+                flags: keyboard::RIGHT_SHIFT,
                 ..
             })
         ));
@@ -421,7 +453,7 @@ pub mod tests {
             i.injector.0.last(),
             Some(Event::Scroll {
                 points: -30,
-                flags: keyboard::SHIFT,
+                flags: keyboard::RIGHT_SHIFT,
                 ..
             })
         ));
@@ -453,5 +485,177 @@ pub mod tests {
         assert_eq!(select_display(&all, Some(2)), Some(external));
         assert_eq!(select_display(&all, Some(3)), Some(main));
         assert_eq!(select_display(&all, Some(99)), Some(main));
+    }
+
+    #[test]
+    fn high_resolution_wheels_caps_and_all_buttons_balance() {
+        let mut i = Input::new(Recording::default(), display(), 1.0, true);
+        i.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
+        for _ in 0..4 {
+            for horizontal in [false, true] {
+                i.apply(Message::Scroll {
+                    horizontal,
+                    delta: 1,
+                })
+                .unwrap();
+            }
+        }
+        let scrolls: Vec<_> = i
+            .injector
+            .0
+            .iter()
+            .filter_map(|e| match e {
+                Event::Scroll {
+                    horizontal, points, ..
+                } => Some((*horizontal, *points)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scrolls, [(false, 1), (true, -1)]);
+        for down in [true, true, false] {
+            i.apply(Message::Key {
+                vk: 0x14,
+                scan: 0x3a,
+                extended: false,
+                down,
+            })
+            .unwrap();
+        }
+        for button in 0..5 {
+            i.apply(Message::Button { button, down: true }).unwrap();
+        }
+        assert_eq!(i.held_count(), 5);
+        i.apply(Message::ReleaseAll).unwrap();
+        assert_eq!(i.held_count(), 0);
+        assert_eq!(
+            i.injector
+                .0
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    Event::Key {
+                        code: 57,
+                        down: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(i.injector.0.iter().any(|e| matches!(
+            e,
+            Event::Key {
+                code: 57,
+                down: false,
+                flags: 0,
+                ..
+            }
+        )));
+        for button in 0..5 {
+            assert_eq!(i.injector.0.iter().filter(|e| matches!(e, Event::Button { button: b, down: false, flags: 0, .. } if *b == button)).count(), 1);
+        }
+    }
+
+    #[test]
+    fn native_failure_does_not_skip_other_releases() {
+        struct Failing(Recording);
+        impl Injector for Failing {
+            fn post(&mut self, event: Event) -> Result<()> {
+                if matches!(
+                    event,
+                    Event::Key {
+                        code: 0,
+                        down: false,
+                        ..
+                    }
+                ) {
+                    anyhow::bail!("synthetic allocation failure");
+                }
+                self.0.post(event)
+            }
+        }
+        let mut i = Input::new(Failing(Recording::default()), display(), 1.0, true);
+        i.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
+        for (vk, scan) in [(0x5b, 0x5b), (65, 0x1e)] {
+            i.apply(Message::Key {
+                vk,
+                scan,
+                extended: vk == 0x5b,
+                down: true,
+            })
+            .unwrap();
+        }
+        i.apply(Message::Button {
+            button: 0,
+            down: true,
+        })
+        .unwrap();
+        assert!(i.release().is_err());
+        assert_eq!(i.epoch, None);
+        assert_eq!(i.held_count(), 0);
+        assert!(matches!(
+            i.injector.0 .0.last(),
+            Some(Event::Button {
+                button: 0,
+                down: false,
+                ..
+            })
+        ));
+        assert!(i.injector.0 .0.iter().any(|e| matches!(
+            e,
+            Event::Key {
+                code: 55,
+                down: false,
+                flags: 0,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn aliased_keys_do_not_release_each_other() {
+        let mut i = Input::new(Recording::default(), display(), 1.0, true);
+        i.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
+        for (vk, scan, down) in [(0x2c, 0x37, true), (0x7c, 0x64, true), (0x2c, 0x37, false)] {
+            i.apply(Message::Key {
+                vk,
+                scan,
+                extended: true,
+                down,
+            })
+            .unwrap();
+        }
+        assert_eq!(i.held_count(), 1);
+        assert_eq!(
+            i.injector
+                .0
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    Event::Key {
+                        code: 105,
+                        down: false,
+                        ..
+                    }
+                ))
+                .count(),
+            0
+        );
+        i.apply(Message::Key {
+            vk: 0x7c,
+            scan: 0x64,
+            extended: true,
+            down: false,
+        })
+        .unwrap();
+        assert_eq!(i.held_count(), 0);
+        assert!(matches!(
+            i.injector.0.last(),
+            Some(Event::Key {
+                code: 105,
+                down: false,
+                ..
+            })
+        ));
     }
 }
