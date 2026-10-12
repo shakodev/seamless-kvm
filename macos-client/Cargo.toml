@@ -3,3 +3,20 @@ name = "macos-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[features]
+# For cargo check/clippy on Windows; never links or runs Apple frameworks there.
+native-check = []
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+shared = { path = "../shared" }
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
