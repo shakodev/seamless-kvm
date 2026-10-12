@@ -1,0 +1,12 @@
+host = "192.168.1.10:24800"
+certificate_sha256 = "REPLACE_WITH_PIN_FROM_GENERATED_MOCK_CONFIG"
+pairing_secret = "REPLACE_WITH_64_HEX_CHARACTERS_FROM_PAIR_COMMAND"
+heartbeat_timeout_ms = 2000
+reconnect_ms = 1000
+
+# Optional external CGDirectDisplayID from `macos-client displays`.
+# Missing, unplugged, built-in, or mirrored-secondary selection falls back to main.
+# display_id = 123456789
+win_to_command = true
+# Logical macOS points per physical Windows mouse count; Retina needs no multiplier.
+pointer_speed = 1.0

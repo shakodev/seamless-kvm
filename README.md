@@ -1,6 +1,6 @@
-# SeamlessKVM — Stage 1
+# SeamlessKVM — Stage 2
 
-Windows 11 sends keyboard and mouse input over authenticated TLS to a Windows-compatible mock client. The mock simulates a macOS screen and held input state; it never injects input. The native macOS client is a placeholder for a later stage. No video, clipboard, web UI, or background service.
+Windows 11 controls a native Rust macOS client over authenticated TLS. Move past Windows' right edge to enter the selected Mac display; move left past that display's left edge to return. Quartz injects keyboard, mouse, dragging, and scrolling events in protocol order. The Stage 1 mock remains available for testing without injection. No video, clipboard, web UI, or background service.
 
 ## Build and pair
 
@@ -16,7 +16,40 @@ Set `[monitor]` in `certs/host.local.toml` to the physical pixel bounds of the W
 
 The pairing command creates a self-signed certificate, PKCS#8 DER private key, random 256-bit secret, and matching host/mock configurations. It refuses to overwrite files. Keep the private key and both configurations private. Copy only `mock.local.toml` to the client through a trusted channel. The SHA-256 certificate pin is the trust anchor: TLS checks possession of its private key, without relying on CA, hostname, or expiration checks. Changing the certificate requires updating the pin. Regenerate in a new directory to rotate credentials.
 
-## Run on one Windows machine
+## Build and run on macOS
+
+Use an interactive logged-in macOS desktop with stable Rust and Apple's command line tools (`xcode-select --install`). Build on the Mac for its architecture (Apple silicon or Intel); Windows builds do not produce a macOS executable:
+
+```sh
+cargo build --release -p macos-client
+./target/release/macos-client displays
+```
+
+Copy the generated `mock.local.toml` through a trusted channel to the Mac as `macos.local.toml`. It contains the pin and pairing secret; **never copy the host private key**. Set `host` to the Windows LAN IP, set the host's `listen` to that same IP, and permit TCP 24800 on the Windows Private firewall profile. Only one client can connect, so stop the mock before using the native client. Protect the Mac configuration with `chmod 600 macos.local.toml`.
+
+The generated Stage 1 file works directly; native display discovery ignores its `screen_width`/`screen_height`. Optional native settings are shown in [config/macos.example.toml](config/macos.example.toml):
+
+- `display_id`: an external display ID printed by `displays`. If it is absent/unavailable, built-in, or a mirror secondary, use the main display. IDs can change after reconnecting hardware or rebooting; run `displays` again if needed.
+- `win_to_command = true`: left/right Windows keys become left/right Command. Set false to ignore Windows keys. Ctrl remains Control; Alt becomes Option. Physical scan positions use the Mac's selected input layout, so select matching layouts for matching characters. AltGr arrives as Windows Ctrl+Alt, not macOS Option alone.
+- `pointer_speed = 1.0`: logical macOS display points per physical mouse count. Entry and return preserve normalized vertical position across resolutions. Retina backing pixels need no extra multiplier; adjust speed for comfort. The cursor stays within the selected display.
+
+Run the diagnostic once to request Accessibility permission:
+
+```sh
+./target/release/macos-client check macos.local.toml
+```
+
+If denied, the client exits before connecting. Follow the macOS prompt to **System Settings → Privacy & Security → Accessibility** (or the category named by your OS). Enable the launching terminal and/or client shown by macOS; add the client binary with the `+` button if needed. Restart the terminal/client and rerun `check`. Rebuilding or moving an unsigned binary may require granting permission again. `AXIsProcessTrustedWithOptions` checks authorization; the client never edits the permission database or bypasses security. The diagnostic enumerates displays and creates/destroys a Quartz source without injecting input or connecting to Windows. Screen Recording is not used.
+
+Start the Windows host with its existing configuration, then on the Mac:
+
+```sh
+./target/release/macos-client macos.local.toml
+```
+
+Wait for ready on both machines, then cross Windows' right edge. Held modifiers, keys, and buttons transfer with control; dragging continues inside the selected Mac display. The client releases held input on return, new entry, `ReleaseAll`, disconnect, heartbeat expiry, and graceful shutdown (Ctrl+C, SIGTERM, SIGHUP). It reconnects automatically after host/network failure or emergency disconnect, without replaying input. Permission revocation releases input best effort and exits with setup guidance. Display changes close the current session, release holds, then re-enumerate and reconnect using current bounds. No display polling or input hooks run on the Mac; permission checks share the 200 ms heartbeat timer.
+
+## Mock test on one Windows machine
 
 First check native API startup with input always passing through:
 
@@ -46,7 +79,9 @@ For LAN testing, set host `listen` to its private LAN IP and mock `host` to that
 - Disconnect, malformed frames, invalid client messages, queue overflow, emergency, and shutdown restore local control. `ReleaseAll` is best effort over a usable connection; the mock also independently releases on disconnect/timeout. Stale return messages cannot end a newer switch.
 - A separate small watchdog process clears cursor confinement after host exit/crash or a 1-second input-pump stall. It revokes a stalled pump before it can resume interception. Windows removes hooks when their owner exits.
 - Use a physical relative mouse on the ordinary interactive desktop. Absolute mouse devices fail back to local control. Elevated windows, secure desktops/UAC, applications reading their own Raw Input, and other software that replaces global cursor confinement are outside Stage 1's isolation guarantees. Low-level hooks suppress legacy Windows input, not other applications' independently registered Raw Input.
-- Display topology is validated at startup; restart and update bounds after changing monitors. A second host or native diagnostic in the same Windows session is rejected. No macOS injection or macOS validation is included.
+- Windows display topology is validated at startup; restart and update host bounds after changing Windows monitors. A second host or native diagnostic in the same Windows session is rejected. The Mac handles display changes by disconnecting and reselecting its display.
+- Quartz event posting has no delivery acknowledgement. Secure input, login/lock screens, permission revocation, and applications that reject synthetic events can prevent injection. Use one input source at a time: simultaneous physical Mac input can displace the cursor or interfere with modifiers. SIGKILL, process abort, power loss, or revoked permission can prevent final native releases; the Windows host still independently restores local control on timeout. This client does not install a Mac watchdog.
+- Standard ANSI/ISO scan positions, common JIS positions, F1–F20, navigation/keypad, and left/right modifiers are mapped. Pause/PrintScreen become F15/F13, ScrollLock becomes F14, NumLock becomes keypad Clear. Media/vendor/Fn/menu keys and F21–F24 are ignored. Caps Lock transitions during remote control are supported, but existing Windows/Mac lock states and LEDs are not synchronized by protocol v1. Double/triple clicks use a 500 ms, 4-point threshold. Mouse side-button actions depend on the Mac application.
 
 ## Checks
 
@@ -57,6 +92,14 @@ cargo test --workspace
 ```
 
 Tests cover framing, partial reads, pinning, pairing rejection, switching, drag state, abrupt disconnects, heartbeat expiry, extra-client rejection, stale sessions, and release behavior. `windows-host check` verifies actual Win32 setup/teardown while input passes through. Physical edge crossing, emergency keys, and mixed-DPI behavior still require interactive testing on the intended Windows desktop; automated checks do not certify those hardware paths. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the wire format and invariants.
+
+The native client's tests additionally exercise scan/modifier mapping, negative display origins, scaling/clamping, ordered Quartz event descriptions, repeated keys, TLS entry/return and release on failure. Windows can type-check the isolated native Rust code with `cargo clippy -p macos-client --all-targets --features native-check -- -D warnings`; use this feature only for check/Clippy on non-macOS, since Apple frameworks cannot link there. On macOS, run the workspace checks above and the opt-in desktop diagnostic test:
+
+```sh
+cargo test -p macos-client native::tests::desktop_setup_and_teardown -- --ignored
+```
+
+**Current validation:** Windows formatting, Clippy, 29 automated tests, workspace development build, and the Win32 startup/teardown diagnostic passed. A macOS build and actual Windows↔macOS input validation have not been performed in this environment. Follow [docs/STAGE2_VALIDATION.md](docs/STAGE2_VALIDATION.md) on the intended machines before relying on native input behavior.
 
 If using the workspace-local toolchain prepared during development, enable it for the current PowerShell session before running Cargo:
 

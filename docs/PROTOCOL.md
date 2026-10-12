@@ -19,7 +19,7 @@ All integers are little-endian. Every frame has an 8-byte header: ASCII `SK`, ve
 | 11 | Heartbeat | sender counter `u64` |
 | 12 | ReleaseAll | empty |
 
-Booleans are 0/1. Buttons 0..4 mean left, right, middle, X1, X2. Scroll preserves signed Win32 wheel units (usually 120 per detent), including partial detents. Key repeat is represented by repeated downs. Left/right modifier virtual keys and extended scan flags remain distinct. The eventual macOS client must map these physical keys to native events; this stage does not implement that mapping. Width/height are 2..32768, with nonoverflowing coordinate endpoints.
+Booleans are 0/1. Buttons 0..4 mean left, right, middle, X1, X2. Scroll preserves signed Win32 wheel units (usually 120 per detent), including partial detents. Key repeat is represented by repeated downs. Left/right modifier virtual keys and extended scan flags remain distinct. The native macOS client maps physical set-1 positions to Quartz key codes, with configurable Win→Command mapping. Width/height are 2..32768, with nonoverflowing coordinate endpoints.
 
 Handshake (TLS plus application exchange has a 3-second deadline): client Hello; host Welcome + Screen; client Screen + Ready; host Ready. Only then may suppression start. The listener admits one handshake/session at a time and drops extra connections while a ready session is active. Rejected authentication never grants control.
 
@@ -30,3 +30,7 @@ At entry the client clears old state, records the epoch, starts at x=0, and maps
 Both endpoints send independent heartbeats every 200 ms and require peer heartbeats before their configured timeout; input traffic cannot keep a silent peer alive. A dedicated reader task owns partial-frame state so `select!` cancellation cannot corrupt framing. Per-frame writes have a 500 ms deadline; once a write fails/times out the stream is discarded. Failure and shutdown revoke host suppression before attempting a best-effort ReleaseAll. Each endpoint must independently clear held input on disconnect or timeout, because release packets cannot be delivered across a broken link.
 
 Input frames are deliberately excluded from Debug/logging. Configuration parse errors omit source snippets to avoid exposing secrets. Queue overflow is a connection failure rather than a dropped press/release. No event replay occurs across reconnection.
+
+The native Mac advertises selected-display logical dimensions with a zero wire origin. Internally it adds the actual global Quartz origin (which can be negative), scales relative mouse counts by `pointer_speed`, and returns when the logical x would cross the selected display's left bound. Native display points are independent of Retina backing pixel counts. Wheel deltas convert to pixel scroll events at 30 points per 120 units, retaining fractional remainders separately per axis; horizontal direction is translated to Quartz's convention. This does not change protocol v1 or the mock's behavior.
+
+Mac display notifications invalidate the session before further input is applied. Releases and TLS closure restore ownership, and a new handshake advertises fresh dimensions after re-enumeration. The client never sends unsolicited Screen updates during a ready session because the existing host does not accept them.
