@@ -1,0 +1,13 @@
+# Generate real credentials with: windows-host pair certs
+listen = "127.0.0.1:24800"
+certificate = "certs/host-cert.der"
+private_key = "certs/host-key.der"
+pairing_secret = "REPLACE_WITH_64_HEX_CHARACTERS_FROM_PAIR_COMMAND"
+heartbeat_timeout_ms = 2000
+
+# Physical desktop coordinates; run windows-host monitors.
+[monitor]
+left = 0
+top = 0
+width = 1920
+height = 1080

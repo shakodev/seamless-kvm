@@ -1,0 +1,7 @@
+host = "127.0.0.1:24800"
+certificate_sha256 = "REPLACE_WITH_PIN_FROM_GENERATED_MOCK_CONFIG"
+pairing_secret = "REPLACE_WITH_64_HEX_CHARACTERS_FROM_PAIR_COMMAND"
+screen_width = 1920
+screen_height = 1080
+heartbeat_timeout_ms = 2000
+reconnect_ms = 1000
