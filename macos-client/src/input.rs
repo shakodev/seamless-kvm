@@ -69,7 +69,6 @@ pub struct Input<I: Injector> {
     scroll_remainder: [i32; 2],
     speed: f64,
     win_to_command: bool,
-    pending_motion: Option<Event>,
 }
 impl<I: Injector> Input<I> {
     pub fn new(injector: I, display: Display, speed: f64, win_to_command: bool) -> Self {
@@ -88,7 +87,6 @@ impl<I: Injector> Input<I> {
             scroll_remainder: [0; 2],
             speed,
             win_to_command,
-            pending_motion: None,
         }
     }
     fn flags(&self) -> u64 {
@@ -104,11 +102,9 @@ impl<I: Injector> Input<I> {
     }
     /// Best effort through all releases, even if one native allocation fails.
     pub fn release(&mut self) -> Result<()> {
-        // Flush before releasing modifiers/buttons, but still attempt every
-        // release if posting the final movement fails.
-        let mut first_error = self.flush_motion().err();
         self.epoch = None;
         self.physical_keys.fill(None);
+        let mut first_error = None;
         for modifiers in [false, true] {
             for code in 0..128 {
                 if self.keys[code] && (keyboard::modifier(code as u16) != 0) == modifiers {
@@ -159,26 +155,6 @@ impl<I: Injector> Input<I> {
         first_error.map_or(Ok(()), Err)
     }
     pub fn apply(&mut self, message: Message) -> Result<Option<Message>> {
-        let reply = self.apply_queued(message)?;
-        self.flush_motion()?;
-        Ok(reply)
-    }
-    /// Only the session's bounded, already-available burst may defer hover
-    /// posting. A lone sample is flushed immediately, with no smoothing timer.
-    pub(crate) fn flush_motion(&mut self) -> Result<()> {
-        if let Some(event) = self.pending_motion.take() {
-            self.injector.post(event)?;
-        }
-        Ok(())
-    }
-    pub(crate) fn apply_queued(&mut self, message: Message) -> Result<Option<Message>> {
-        // Never move across a key/button/scroll/entry/release ordering barrier.
-        if !matches!(
-            message,
-            Message::Move { .. } | Message::Enter { .. } | Message::ReleaseAll
-        ) {
-            self.flush_motion()?;
-        }
         if let Message::Enter { epoch, y } = message {
             self.release()?;
             self.epoch = Some(epoch);
@@ -221,34 +197,16 @@ impl<I: Injector> Input<I> {
                 if self.x == old_x && self.y == old_y {
                     return Ok(None);
                 }
-                // Differences of rounded positions retain fractional counts
-                // across reports; rounding each delta loses/overstates motion
-                // at speeds such as 0.25 and 0.5 points per count.
-                let mut dx = self.x.round() as i64 - old_x.round() as i64;
-                let mut dy = self.y.round() as i64 - old_y.round() as i64;
-                if let Some(Event::Motion {
-                    dx: queued_x,
-                    dy: queued_y,
-                    ..
-                }) = self.pending_motion
-                {
-                    dx += queued_x;
-                    dy += queued_y;
-                }
-                let drag = self.buttons.iter().position(|b| *b).map(|b| b as u8);
-                self.pending_motion = Some(Event::Motion {
+                // Retain sub-point motion across reports. Do not combine
+                // separate movements into a larger cursor step.
+                self.injector.post(Event::Motion {
                     x: self.x,
                     y: self.y,
-                    drag,
-                    dx,
-                    dy,
+                    drag: self.buttons.iter().position(|b| *b).map(|b| b as u8),
+                    dx: self.x.round() as i64 - old_x.round() as i64,
+                    dy: self.y.round() as i64 - old_y.round() as i64,
                     flags: self.flags(),
-                });
-                // Drawing and drag selection need the entire path, even when
-                // the network delivered a burst. Only hover motion coalesces.
-                if drag.is_some() {
-                    self.flush_motion()?;
-                }
+                })?;
             }
             Message::Key {
                 vk,
@@ -410,255 +368,15 @@ pub mod tests {
     }
 
     #[test]
-    fn queued_hover_reduces_posts_but_preserves_every_samples_position_effect() {
-        for count in [2000, 8000] {
-            let mut i = Input::new(Recording::default(), display(), 0.25, true);
-            let mut direct = Input::new(Recording::default(), display(), 0.25, true);
-            for input in [&mut i, &mut direct] {
-                input.apply(Message::Enter { epoch: 1, y: 32768 }).unwrap();
-                input.injector.0.clear();
-            }
-            for n in 0..count {
-                // Alternating directions also exercise fractional accumulation.
-                let message = Message::Move {
-                    dx: if n % 4 == 3 { 1 } else { -1 },
-                    dy: 0,
-                };
-                i.apply_queued(message).unwrap();
-                direct.apply(message).unwrap();
-                if (n + 1) % shared::connection::MAX_BATCH_MESSAGES == 0 {
-                    i.flush_motion().unwrap();
-                }
-            }
-            i.flush_motion().unwrap();
-            assert_eq!((i.x, i.y, i.epoch), (direct.x, direct.y, direct.epoch));
-            assert_eq!(
-                i.injector.0.len(),
-                count.div_ceil(shared::connection::MAX_BATCH_MESSAGES)
-            );
-            assert_eq!(direct.injector.0.len(), count);
-            let sum = |events: &[Event]| {
-                events
-                    .iter()
-                    .map(|e| match e {
-                        Event::Motion { dx, .. } => *dx,
-                        _ => 0,
-                    })
-                    .sum::<i64>()
-            };
-            assert_eq!(sum(&i.injector.0), sum(&direct.injector.0));
-        }
-    }
-
-    #[test]
-    fn queued_motion_flushes_at_barriers_and_keeps_the_entire_drag_path() {
-        let mut i = Input::new(Recording::default(), display(), 1.0, true);
-        i.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
-        i.injector.0.clear();
-        for message in [
-            Message::Move { dx: -1, dy: 0 },
-            Message::Move { dx: -2, dy: 0 },
-            Message::Key {
-                vk: 16,
-                scan: 42,
-                extended: false,
-                down: true,
-            },
-            Message::Move { dx: -3, dy: 0 },
-            Message::Button {
-                button: 0,
-                down: true,
-            },
-            Message::Move { dx: -4, dy: 1 },
-            Message::Move { dx: 2, dy: 1 },
-            Message::Button {
-                button: 0,
-                down: false,
-            },
-            Message::Move { dx: -5, dy: 0 },
-            Message::Scroll {
-                horizontal: false,
-                delta: 120,
-            },
-            Message::Move { dx: -6, dy: 0 },
-            Message::ReleaseAll,
-        ] {
-            i.apply_queued(message).unwrap();
-        }
-        let events = &i.injector.0;
-        assert_eq!(events.len(), 11);
-        assert!(matches!(
-            events[0],
-            Event::Motion {
-                x: -4.0,
-                dx: -3,
-                flags: 0,
-                ..
-            }
-        ));
-        assert!(matches!(events[1], Event::Key { down: true, .. }));
-        assert!(matches!(
-            events[2],
-            Event::Motion {
-                x: -7.0,
-                dx: -3,
-                flags,
-                ..
-            } if flags == keyboard::modifier(56)
-        ));
-        assert!(matches!(
-            events[3],
-            Event::Button {
-                x: -7.0,
-                down: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            events[4],
-            Event::Motion {
-                x: -11.0,
-                drag: Some(0),
-                ..
-            }
-        ));
-        assert!(matches!(
-            events[5],
-            Event::Motion {
-                x: -9.0,
-                drag: Some(0),
-                ..
-            }
-        ));
-        assert!(matches!(
-            events[6],
-            Event::Button {
-                x: -9.0,
-                down: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            events[7],
-            Event::Motion {
-                x: -14.0,
-                drag: None,
-                ..
-            }
-        ));
-        assert!(matches!(events[8], Event::Scroll { .. }));
-        assert!(matches!(events[9], Event::Motion { x: -20.0, .. }));
-        assert!(matches!(events[10], Event::Key { down: false, .. }));
-        assert_eq!(i.held_count(), 0);
-        assert!(i.pending_motion.is_none());
-    }
-
-    #[test]
-    fn queued_motion_cannot_hide_clamping_or_a_return_crossing() {
-        let mut i = Input::new(Recording::default(), display(), 1.0, true);
-        i.apply(Message::Enter { epoch: 7, y: 0 }).unwrap();
-        i.apply_queued(Message::Move {
-            dx: i32::MIN,
-            dy: i32::MAX,
-        })
-        .unwrap();
-        i.apply_queued(Message::Move { dx: 1, dy: -1 }).unwrap();
-        i.flush_motion().unwrap();
-        assert_eq!((i.x, i.y), (-1599.0, -2.0));
-        assert!(i
-            .apply_queued(Message::Move { dx: 1599, dy: 0 })
-            .unwrap()
-            .is_some());
-        // This reversal would conceal the return if raw deltas were summed first.
-        i.apply_queued(Message::Move { dx: -1599, dy: 0 }).unwrap();
-        i.flush_motion().unwrap();
-        assert_eq!(i.epoch, None);
-        assert_eq!((i.x, i.y), (-1599.0, -2.0));
-    }
-
-    #[test]
     fn lone_move_posts_immediately_and_stationary_reports_do_not_post() {
         let mut i = Input::new(Recording::default(), display(), 1.0, true);
         i.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
         i.injector.0.clear();
         i.apply(Message::Move { dx: -1, dy: 0 }).unwrap();
         assert_eq!(i.injector.0.len(), 1);
-        assert!(i.pending_motion.is_none());
         i.apply(Message::Move { dx: 0, dy: 0 }).unwrap();
-        i.apply(Message::Move { dx: 0, dy: -1 }).unwrap(); // top clamp
+        i.apply(Message::Move { dx: 0, dy: -1 }).unwrap();
         assert_eq!(i.injector.0.len(), 1);
-    }
-
-    #[test]
-    fn failed_pending_motion_still_releases_held_keys() {
-        #[derive(Default)]
-        struct Failing {
-            recording: Recording,
-            fail_motion: bool,
-        }
-        impl Injector for Failing {
-            fn post(&mut self, event: Event) -> Result<()> {
-                if self.fail_motion && matches!(event, Event::Motion { .. }) {
-                    anyhow::bail!("synthetic motion failure");
-                }
-                self.recording.post(event)
-            }
-        }
-        let mut i = Input::new(Failing::default(), display(), 1.0, true);
-        i.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
-        i.apply(Message::Key {
-            vk: 16,
-            scan: 42,
-            extended: false,
-            down: true,
-        })
-        .unwrap();
-        i.apply_queued(Message::Move { dx: -10, dy: 0 }).unwrap();
-        i.injector.fail_motion = true;
-        assert!(i.apply_queued(Message::ReleaseAll).is_err());
-        assert_eq!(i.held_count(), 0);
-        assert_eq!(i.epoch, None);
-        assert!(i.pending_motion.is_none());
-        assert!(matches!(
-            i.injector.recording.0.last(),
-            Some(Event::Key {
-                down: false,
-                flags: 0,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn new_entry_flushes_old_motion_without_replaying_it() {
-        let mut i = Input::new(Recording::default(), display(), 1.0, true);
-        i.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
-        i.injector.0.clear();
-        i.apply_queued(Message::Move { dx: -10, dy: 0 }).unwrap();
-        i.apply_queued(Message::Enter { epoch: 2, y: 65535 })
-            .unwrap();
-        i.flush_motion().unwrap();
-        assert_eq!(i.epoch, Some(2));
-        assert_eq!(i.injector.0.len(), 2);
-        assert!(matches!(
-            i.injector.0[0],
-            Event::Motion {
-                x: -11.0,
-                y: -900.0,
-                dx: -10,
-                ..
-            }
-        ));
-        assert!(matches!(
-            i.injector.0[1],
-            Event::Motion {
-                x: -1.0,
-                y: -1.0,
-                dx: 0,
-                ..
-            }
-        ));
-        assert!(i.pending_motion.is_none());
     }
 
     #[test]
