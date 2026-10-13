@@ -10,6 +10,7 @@ use std::{
 };
 use tokio::{
     sync::Notify,
+    task::JoinSet,
     time::{interval, MissedTickBehavior},
 };
 
@@ -45,30 +46,53 @@ pub async fn run<S, I, F>(
     limit: Duration,
     changes: &DisplayChanges,
     generation: u64,
-    mut permission: F,
+    permission: F,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     I: Injector,
-    F: FnMut() -> Result<()>,
+    F: FnMut() -> Result<()> + Send + 'static,
 {
     let result: Result<()> = async {
         let mut tick = interval(connection::HEARTBEAT_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_rx = Instant::now();
         let mut serial = 0u64;
+        let mut permission = Some(permission);
+        let mut checks = JoinSet::new();
+        let mut check_started = Instant::now();
         loop {
             tokio::select! {
                 biased;
                 _ = tick.tick() => {
                     ensure!(last_rx.elapsed() < limit, "host heartbeat expired");
                     ensure!(changes.generation() == generation, "display configuration changed");
-                    permission()?;
+                    // AXIsProcessTrustedWithOptions is a synchronous OS call.
+                    // Running it on the input executor every 200 ms can pause
+                    // posting and accumulate a burst. Keep at most one check
+                    // in flight; a stalled check still fails the session closed.
+                    if checks.is_empty() {
+                        let mut check = permission.take().expect("permission checker available");
+                        check_started = Instant::now();
+                        checks.spawn_blocking(move || {
+                            let result = check();
+                            (check, result)
+                        });
+                    } else {
+                        ensure!(check_started.elapsed() < limit, "permission check stalled");
+                    }
                     serial = serial.wrapping_add(1);
                     conn.send(Message::Heartbeat(serial)).await?;
                 }
                 _ = changes.notify.notified() => {
                     ensure!(changes.generation() == generation, "display configuration changed");
+                }
+                completed = checks.join_next(), if !checks.is_empty() => {
+                    let (check, result) = completed
+                        .ok_or_else(|| anyhow::anyhow!("permission checker stopped"))?
+                        .map_err(|_| anyhow::anyhow!("permission checker failed"))?;
+                    permission = Some(check);
+                    result?;
                 }
                 event = conn.incoming.recv() => {
                     ensure!(changes.generation() == generation, "display configuration changed");
@@ -95,6 +119,124 @@ mod tests {
     use super::*;
     use crate::input::tests::{display, Recording};
     use shared::connection::Connection;
+
+    #[tokio::test]
+    async fn slow_permission_check_does_not_pause_mouse_posting() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        struct Observed {
+            recording: Recording,
+            moved: Arc<Notify>,
+        }
+        impl Injector for Observed {
+            fn post(&mut self, event: crate::input::Event) -> Result<()> {
+                self.recording.post(event)?;
+                if matches!(event, crate::input::Event::Motion { dx: -1, .. }) {
+                    self.moved.notify_one();
+                }
+                Ok(())
+            }
+        }
+        let moved = Arc::new(Notify::new());
+        let checking = Arc::new(AtomicBool::new(false));
+        let worker_checking = checking.clone();
+        let (started, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let permission = move || {
+            worker_checking.store(true, Ordering::Release);
+            let _ = started.try_send(());
+            // Timeout ensures even a failing test cannot strand a blocking task.
+            let _ = resume_rx.recv_timeout(Duration::from_secs(1));
+            worker_checking.store(false, Ordering::Release);
+            Ok(())
+        };
+        let (client, _host) = tokio::io::duplex(4096);
+        let mut conn = Connection::new(client);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        conn.incoming = rx;
+        let mut input = Input::new(
+            Observed {
+                recording: Recording::default(),
+                moved: moved.clone(),
+            },
+            display(),
+            1.0,
+            true,
+        );
+        input.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
+        let driver = async {
+            started_rx.recv().await.unwrap();
+            tx.send(Ok(Message::Move { dx: -1, dy: 0 })).await.unwrap();
+            let posted = tokio::time::timeout(Duration::from_millis(100), moved.notified()).await;
+            let still_checking = checking.load(Ordering::Acquire);
+            let _ = resume.send(());
+            tx.send(Ok(Message::Ready)).await.unwrap();
+            assert!(posted.is_ok(), "mouse stalled behind permission check");
+            assert!(
+                still_checking,
+                "movement only arrived after the blocking check ended"
+            );
+        };
+        let changes = DisplayChanges::default();
+        let (result, ()) = tokio::join!(
+            run(
+                &mut conn,
+                &mut input,
+                Duration::from_secs(2),
+                &changes,
+                0,
+                permission
+            ),
+            driver
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn stalled_permission_check_expires_despite_healthy_heartbeats() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let checks = Arc::new(AtomicUsize::new(0));
+        let worker_checks = checks.clone();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let permission = move || {
+            worker_checks.fetch_add(1, Ordering::Relaxed);
+            let _ = resume_rx.recv_timeout(Duration::from_secs(2));
+            Ok(())
+        };
+        let (client, _host) = tokio::io::duplex(4096);
+        let mut conn = Connection::new(client);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        conn.incoming = rx;
+        let mut input = Input::new(Recording::default(), display(), 1.0, true);
+        input.apply(Message::Enter { epoch: 1, y: 0 }).unwrap();
+        input
+            .apply(Message::Button {
+                button: 0,
+                down: true,
+            })
+            .unwrap();
+        let heartbeats = async {
+            loop {
+                if tx.send(Ok(Message::Heartbeat(1))).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let changes = DisplayChanges::default();
+        let result = tokio::select! {
+            result = run(&mut conn, &mut input, Duration::from_millis(250), &changes, 0, permission) => result,
+            _ = heartbeats => panic!("heartbeat sender stopped"),
+        };
+        let _ = resume.send(());
+        assert_eq!(result.unwrap_err().to_string(), "permission check stalled");
+        assert_eq!(
+            checks.load(Ordering::Relaxed),
+            1,
+            "checks must not pile up while one is running"
+        );
+        assert_eq!(input.held_count(), 0);
+        assert_eq!(input.epoch, None);
+    }
 
     #[tokio::test]
     async fn queued_movements_post_individually_before_failure_cleanup() {
@@ -171,7 +313,7 @@ mod tests {
                 down: true,
             })
             .unwrap();
-        let permission = || {
+        let permission = move || {
             ensure!(kind != 2, "permission revoked");
             Ok(())
         };
