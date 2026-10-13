@@ -25,10 +25,10 @@ pub async fn signal(managed: bool) -> Result<()> {
     std::thread::Builder::new()
         .name("gui-lifetime".into())
         .spawn(move || watch(std::io::stdin().lock(), tx))?;
-    tokio::select! {
-        _ = rx => Ok(()),
-        result = tokio::signal::ctrl_c() => { result?; Ok(()) }
-    }
+    // A GUI-launched host has no console. Its pipe is the shutdown authority;
+    // do not require console-control handler registration in this mode.
+    let _ = rx.await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -55,5 +55,50 @@ mod tests {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         watch(Broken, tx);
         assert_eq!(rx.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn managed_child() {
+        if std::env::var_os("SEAMLESS_TEST_MANAGED_CHILD").is_some() {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(signal(true))
+                .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detached_process_stops_when_parent_pipe_closes() {
+        use std::{
+            os::windows::process::CommandExt,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "shutdown::tests::managed_child"])
+            .env("SEAMLESS_TEST_MANAGED_CHILD", "1")
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW, matching the GUI.
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(child.stdin.take());
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("detached host did not stop on EOF");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
