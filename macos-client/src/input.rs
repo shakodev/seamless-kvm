@@ -76,7 +76,7 @@ impl<I: Injector> Input<I> {
             injector,
             display,
             epoch: None,
-            x: f64::from(display.bounds.left),
+            x: f64::from(display.bounds.right()),
             y: f64::from(display.bounds.top),
             keys: [false; 128],
             physical_keys: [None; 512],
@@ -158,7 +158,7 @@ impl<I: Injector> Input<I> {
         if let Message::Enter { epoch, y } = message {
             self.release()?;
             self.epoch = Some(epoch);
-            self.x = f64::from(self.display.bounds.left);
+            self.x = f64::from(self.display.bounds.right());
             self.y = f64::from(self.display.bounds.denormalize_y(y));
             self.injector.post(Event::Motion {
                 x: self.x,
@@ -184,7 +184,7 @@ impl<I: Injector> Input<I> {
                 let old_y = self.y;
                 self.y = (self.y + f64::from(dy) * self.speed)
                     .clamp(f64::from(b.top), f64::from(b.top) + f64::from(b.height - 1));
-                if next_x < f64::from(b.left) {
+                if next_x > f64::from(b.right()) {
                     let reply = Message::Return {
                         epoch: self.epoch.unwrap(),
                         y: b.normalize_y(self.y.round() as i32),
@@ -193,7 +193,7 @@ impl<I: Injector> Input<I> {
                     return Ok(Some(reply));
                 }
                 let old_x = self.x;
-                self.x = next_x.min(f64::from(b.right()));
+                self.x = next_x.max(f64::from(b.left));
                 self.injector.post(Event::Motion {
                     x: self.x,
                     y: self.y,
@@ -340,7 +340,7 @@ pub mod tests {
     fn scaled_negative_origin_drag_return_and_release_order() {
         let mut i = Input::new(Recording::default(), display(), 0.5, true);
         i.apply(Message::Enter { epoch: 8, y: 65535 }).unwrap();
-        assert_eq!((i.x, i.y), (-1600.0, -1.0));
+        assert_eq!((i.x, i.y), (-1.0, -1.0));
         i.apply(Message::Key {
             vk: 0x5b,
             scan: 0x5b,
@@ -361,11 +361,11 @@ pub mod tests {
         })
         .unwrap();
         i.apply(Message::Move {
-            dx: 100,
+            dx: -100,
             dy: i32::MIN,
         })
         .unwrap();
-        assert_eq!((i.x, i.y), (-1550.0, -900.0));
+        assert_eq!((i.x, i.y), (-51.0, -900.0));
         assert!(matches!(
             i.injector.0.last(),
             Some(Event::Motion {
@@ -374,7 +374,7 @@ pub mod tests {
                 ..
             })
         ));
-        let reply = i.apply(Message::Move { dx: -101, dy: 0 }).unwrap();
+        let reply = i.apply(Message::Move { dx: 101, dy: 0 }).unwrap();
         assert!(reply == Some(Message::Return { epoch: 8, y: 0 }));
         assert_eq!(i.held_count(), 0);
         let events = &i.injector.0;
@@ -456,11 +456,11 @@ pub mod tests {
         assert_eq!(i.held_count(), 0);
         assert_eq!(i.epoch, Some(2));
         i.apply(Message::Move {
-            dx: i32::MAX,
+            dx: i32::MIN,
             dy: i32::MAX,
         })
         .unwrap();
-        assert_eq!((i.x, i.y), (-1.0, -1.0));
+        assert_eq!((i.x, i.y), (-1600.0, -1.0));
     }
     #[test]
     fn display_fallback() {
@@ -682,5 +682,42 @@ pub mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn only_right_crossing_returns_and_entry_keeps_vertical_position() {
+        let mut i = Input::new(Recording::default(), display(), 1.0, true);
+        for y in [0, 32768, 65535] {
+            i.apply(Message::Enter { epoch: 4, y }).unwrap();
+            assert_eq!(i.x, -1.0);
+            assert_eq!(i.y, f64::from(display().bounds.denormalize_y(y)));
+            assert!(matches!(
+                i.injector.0.last(),
+                Some(Event::Motion {
+                    x: -1.0,
+                    drag: None,
+                    ..
+                })
+            ));
+            assert!(i
+                .apply(Message::Move {
+                    dx: i32::MIN,
+                    dy: 0
+                })
+                .unwrap()
+                .is_none());
+            assert_eq!(i.x, -1600.0);
+            assert_eq!(i.epoch, Some(4));
+            assert!(i
+                .apply(Message::Move { dx: 1599, dy: 0 })
+                .unwrap()
+                .is_none());
+            assert_eq!(i.x, -1.0);
+            assert!(i.apply(Message::Move { dx: 0, dy: 0 }).unwrap().is_none());
+            let reply = i.apply(Message::Move { dx: 1, dy: 0 }).unwrap();
+            assert!(
+                matches!(reply, Some(Message::Return { epoch: 4, y: returned }) if returned.abs_diff(y) < 100)
+            );
+        }
     }
 }

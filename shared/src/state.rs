@@ -17,7 +17,7 @@ impl SwitchState {
         self.remote
     }
     pub fn enter(&mut self, b: Bounds, x: i32, y: i32, dx: i32) -> Option<Message> {
-        if !self.ready || self.remote || dx <= 0 || x < b.right() {
+        if !self.ready || self.remote || dx >= 0 || x > b.left {
             return None;
         }
         self.epoch = self.epoch.wrapping_add(1);
@@ -40,7 +40,7 @@ impl SwitchState {
     }
 }
 
-/// The mock and future native client clear this on every ownership/failure boundary.
+/// The mock clears this on every ownership/failure boundary.
 pub struct ClientState {
     pub bounds: Bounds,
     pub x: i32,
@@ -77,7 +77,7 @@ impl ClientState {
             Message::Enter { epoch, y } => {
                 self.release();
                 self.epoch = Some(epoch);
-                self.x = 0;
+                self.x = self.bounds.width as i32 - 1;
                 self.y = self.bounds.denormalize_y(y);
             }
             Message::ReleaseAll => self.release(),
@@ -87,7 +87,7 @@ impl ClientState {
                     i64::from(self.bounds.top),
                     i64::from(self.bounds.top) + i64::from(self.bounds.height) - 1,
                 ) as i32;
-                if x < 0 {
+                if x > i64::from(self.bounds.width) - 1 {
                     let r = Message::Return {
                         epoch: self.epoch.unwrap(),
                         y: self.bounds.normalize_y(self.y),
@@ -95,7 +95,7 @@ impl ClientState {
                     self.release();
                     return Some(r);
                 }
-                self.x = x.min(i64::from(self.bounds.width) - 1) as i32;
+                self.x = x.max(0) as i32;
             }
             Message::Key { vk, down, .. } if self.epoch.is_some() && vk < 256 => {
                 self.keys[usize::from(vk)] = down
@@ -130,15 +130,17 @@ mod tests {
     #[test]
     fn authenticated_edge_and_stale_return() {
         let mut s = SwitchState::default();
-        assert!(s.enter(bounds(), 1919, 500, 1).is_none());
+        assert!(s.enter(bounds(), 0, 500, -1).is_none());
         s.set_ready(true);
-        assert!(s.enter(bounds(), 1919, 500, -1).is_none());
-        assert!(s.enter(bounds(), 1918, 500, 1).is_none());
-        assert!(s.enter(bounds(), 1919, 500, 1).is_some());
+        assert!(s.enter(bounds(), 0, 500, 1).is_none());
+        assert!(s.enter(bounds(), 0, 500, 0).is_none());
+        assert!(s.enter(bounds(), 1, 500, -1).is_none());
+        assert!(s.enter(bounds(), 1919, 500, 1).is_none());
+        assert!(s.enter(bounds(), 0, 500, -1).is_some());
         assert!(!s.return_local(99));
         assert!(s.remote());
         assert!(s.return_local(1));
-        assert!(s.enter(bounds(), 1919, 500, 1).is_some());
+        assert!(s.enter(bounds(), 0, 500, -1).is_some());
         assert!(!s.return_local(1));
         s.set_ready(false);
         assert!(!s.remote());
@@ -159,12 +161,12 @@ mod tests {
         });
         assert_eq!(c.held_count(), 2);
         c.apply(Message::Move {
-            dx: 10,
+            dx: -10,
             dy: i32::MAX,
         });
         assert_eq!(c.y, 979);
         assert!(matches!(
-            c.apply(Message::Move { dx: -11, dy: 0 }),
+            c.apply(Message::Move { dx: 11, dy: 0 }),
             Some(Message::Return { epoch: 1, .. })
         ));
         assert_eq!(c.held_count(), 0);
@@ -183,5 +185,38 @@ mod tests {
         assert_eq!(b.normalize_y(-100), 0);
         assert_eq!(b.normalize_y(979), 65535);
         assert_eq!(b.denormalize_y(65535), 979);
+    }
+
+    #[test]
+    fn negative_monitor_left_edge_and_mock_right_return() {
+        let b = Bounds {
+            left: -1920,
+            ..bounds()
+        };
+        let mut host = SwitchState::default();
+        host.set_ready(true);
+        assert!(host.enter(b, b.right(), b.top, 1).is_none());
+        assert!(host.enter(b, b.left + 1, b.top, -1).is_none());
+        assert!(host.enter(b, b.left, b.top, -1).is_some());
+
+        let mut client = ClientState::new(b);
+        client.apply(Message::Enter { epoch: 9, y: 65535 });
+        assert_eq!(client.x, 1919);
+        assert_eq!(client.y, 979);
+        assert!(client
+            .apply(Message::Move {
+                dx: i32::MIN,
+                dy: 0
+            })
+            .is_none());
+        assert_eq!(client.x, 0);
+        assert_eq!(client.epoch, Some(9));
+        assert!(client.apply(Message::Move { dx: 1919, dy: 0 }).is_none());
+        assert_eq!(client.x, 1919);
+        assert!(client.apply(Message::Move { dx: 0, dy: 0 }).is_none());
+        assert!(
+            client.apply(Message::Move { dx: 1, dy: 0 })
+                == Some(Message::Return { epoch: 9, y: 65535 })
+        );
     }
 }

@@ -133,7 +133,7 @@ impl Context {
                 let mut p: POINT = zeroed();
                 GetCursorPos(&mut p);
                 SetCursorPos(
-                    self.bounds.right() - 2,
+                    (self.bounds.left + 2).min(self.bounds.right()),
                     y.map(|v| self.bounds.denormalize_y(v))
                         .unwrap_or(p.y)
                         .clamp(
@@ -168,7 +168,10 @@ impl Context {
                 self.quarantined_buttons = self.buttons;
                 unsafe {
                     self.release_clip();
-                    SetCursorPos(self.bounds.right() - 2, self.bounds.denormalize_y(y));
+                    SetCursorPos(
+                        (self.bounds.left + 2).min(self.bounds.right()),
+                        self.bounds.denormalize_y(y),
+                    );
                 }
                 self.send(Message::ReleaseAll);
             }
@@ -186,7 +189,7 @@ impl Context {
             return;
         }
         if let Some(p) = self.pending_edge.take() {
-            self.enter_at(self.bounds.right(), p.y, dx);
+            self.enter_at(self.bounds.left, p.y, dx);
             return;
         }
         let mut p: POINT = unsafe { zeroed() };
@@ -195,7 +198,7 @@ impl Context {
         }
         if p.y < self.bounds.top
             || p.y >= self.bounds.top + self.bounds.height as i32
-            || p.x > self.bounds.right()
+            || p.x < self.bounds.left
         {
             return;
         }
@@ -205,9 +208,9 @@ impl Context {
         let p = POINT { x, y };
         if let Some(enter) = self.switch.enter(self.bounds, p.x, p.y, dx) {
             let clip = RECT {
-                left: self.bounds.right() - 1,
+                left: self.bounds.left + 1,
                 top: p.y,
-                right: self.bounds.right(),
+                right: self.bounds.left + 2,
                 bottom: p.y + 1,
             };
             // Mark ownership before confinement so the helper also covers a
@@ -367,8 +370,8 @@ impl Context {
                 && previous.x <= self.bounds.right()
                 && previous.y >= self.bounds.top
                 && previous.y < self.bounds.top + self.bounds.height as i32
-                && point.x >= self.bounds.right()
-                && point.x > previous.x
+                && point.x <= self.bounds.left
+                && point.x < previous.x
                 && point.y >= self.bounds.top
                 && point.y < self.bounds.top + self.bounds.height as i32
             {

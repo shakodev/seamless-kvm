@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     let limit = config::timeout(config.heartbeat_timeout_ms)?;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
-    println!("Mock client: simulated input only; move left past x=0 to return");
+    println!("Mock client: simulated input only; move right past the screen edge to return");
     loop {
         let connect = async {
             let tcp = TcpStream::connect(&config.host).await?;

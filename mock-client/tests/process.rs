@@ -41,7 +41,7 @@ async fn executable_auto_returns_and_reconnects_after_host_disconnect() {
             let client=connection::host_handshake(&mut tls,[7;32],bounds()).await.unwrap();assert_eq!(client.width,1280);
             let mut conn=Connection::new(tls);conn.send(Message::Enter{epoch,y:32768}).await.unwrap();
             conn.send(Message::Key{vk:0xa2,scan:29,extended:false,down:true}).await.unwrap();conn.send(Message::Button{button:0,down:true}).await.unwrap();
-            conn.send(Message::Move{dx:20,dy:0}).await.unwrap();
+            conn.send(Message::Move{dx:-20,dy:0}).await.unwrap();
             let mut ticks=tokio::time::interval(connection::HEARTBEAT_INTERVAL);
             loop {
                 tokio::select!{

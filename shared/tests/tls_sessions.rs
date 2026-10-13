@@ -54,8 +54,8 @@ async fn pinned_tls_ordered_drag_return_and_abrupt_disconnect() {
                     button: 0,
                     down: true,
                 },
-                Message::Move { dx: 20, dy: 5 },
-                Message::Move { dx: -21, dy: 0 },
+                Message::Move { dx: -20, dy: 5 },
+                Message::Move { dx: 21, dy: 0 },
             ] {
                 conn.send(message).await.unwrap();
             }

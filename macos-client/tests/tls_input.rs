@@ -79,8 +79,8 @@ async fn host_protocol_drives_native_engine_and_releases_after_tls_loss() {
                     Message::Key { vk: 65, scan: 0x1e, extended: false, down: true },
                     Message::Button { button: 0, down: true },
                     Message::Scroll { horizontal: false, delta: 120 },
-                    Message::Move { dx: 12, dy: 0 },
-                    Message::Move { dx: -13, dy: 0 },
+                    Message::Move { dx: -12, dy: 0 },
+                    Message::Move { dx: 13, dy: 0 },
                 ] { conn.send(message).await.unwrap(); }
                 loop {
                     match conn.incoming.recv().await.unwrap().unwrap() {
