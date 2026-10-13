@@ -184,6 +184,11 @@ impl Context {
     }
     fn movement(&mut self, dx: i32, dy: i32) {
         self.sync_session();
+        // Raw mouse reports also carry buttons/wheels with no movement. Those
+        // transitions are handled by the hooks; don't send redundant Move frames.
+        if dx == 0 && dy == 0 {
+            return;
+        }
         if self.switch.remote() {
             self.send(Message::Move { dx, dy });
             return;

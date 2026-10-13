@@ -61,6 +61,32 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Drain only input already queued, retaining every sample and ordering barrier.
+/// Count stale packets against the budget as well, so reconnects stay bounded.
+fn input_batch(
+    first: InputPacket,
+    input: &mut mpsc::Receiver<InputPacket>,
+    generation: u64,
+    messages: &mut [Message; connection::MAX_BATCH_MESSAGES],
+) -> usize {
+    let mut packet = first;
+    let mut len = 0;
+    for index in 0..connection::MAX_BATCH_MESSAGES {
+        if packet.session == generation {
+            messages[len] = packet.message;
+            len += 1;
+        }
+        if index + 1 == connection::MAX_BATCH_MESSAGES {
+            break;
+        }
+        match input.try_recv() {
+            Ok(next) => packet = next,
+            Err(_) => break,
+        }
+    }
+    len
+}
+
 pub async fn serve(
     config: config::HostConfig,
     bridge: Arc<Bridge>,
@@ -155,7 +181,10 @@ async fn run_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + S
             }
             packet=input.recv()=>{
                 let p=packet.ok_or_else(||anyhow::anyhow!("input worker stopped"))?;
-                if p.session==generation {conn.send(p.message).await?;}
+                ensure!(bridge.healthy() && bridge.session.load(Ordering::Acquire)==generation,"input worker revoked session");
+                let mut messages = [Message::ReleaseAll; connection::MAX_BATCH_MESSAGES];
+                let len = input_batch(p, input, generation, &mut messages);
+                if len != 0 {conn.send_batch(&messages[..len]).await?;}
             }
             extra=listener.accept()=>{if let Ok((s,_))=extra{drop(s);}}
         }
@@ -165,6 +194,71 @@ async fn run_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batching_preserves_samples_and_barriers_and_is_bounded() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let events = [
+            Message::Enter { epoch: 1, y: 0 },
+            Message::Move { dx: -1, dy: 0 },
+            Message::Button {
+                button: 0,
+                down: true,
+            },
+            Message::Move { dx: -2, dy: 1 },
+            Message::Key {
+                vk: 65,
+                scan: 30,
+                extended: false,
+                down: true,
+            },
+            Message::ReleaseAll,
+        ];
+        for &message in &events {
+            tx.try_send(InputPacket {
+                session: 1,
+                message,
+            })
+            .unwrap_or_else(|_| panic!("queue full"));
+        }
+        let mut messages = [Message::Ready; connection::MAX_BATCH_MESSAGES];
+        let first = InputPacket {
+            session: 0,
+            message: Message::Move { dx: 999, dy: 999 },
+        };
+        let len = input_batch(first, &mut rx, 1, &mut messages);
+        assert!(messages[..len] == events);
+        assert!(rx.try_recv().is_err());
+
+        for n in 0..64 {
+            tx.try_send(InputPacket {
+                session: 1,
+                message: Message::Move { dx: n, dy: -n },
+            })
+            .unwrap_or_else(|_| panic!("queue full"));
+        }
+        let first = rx.try_recv().unwrap();
+        assert_eq!(
+            input_batch(first, &mut rx, 1, &mut messages),
+            connection::MAX_BATCH_MESSAGES
+        );
+        assert!(messages[31] == Message::Move { dx: 31, dy: -31 });
+        assert!(rx.try_recv().unwrap().message == Message::Move { dx: 32, dy: -32 });
+    }
+
+    #[test]
+    fn single_packet_is_sent_without_waiting_for_more_input() {
+        let (_tx, mut rx) = mpsc::channel(1);
+        let message = Message::Move { dx: -1, dy: 2 };
+        let first = InputPacket {
+            session: 1,
+            message,
+        };
+        let mut messages = [Message::Ready; connection::MAX_BATCH_MESSAGES];
+        assert_eq!(input_batch(first, &mut rx, 1, &mut messages), 1);
+        assert!(messages[0] == message);
+    }
+
     fn ready_bridge() -> Arc<Bridge> {
         let b = Arc::new(Bridge::new());
         b.session.store(1, Ordering::Release);

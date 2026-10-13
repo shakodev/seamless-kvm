@@ -42,7 +42,7 @@ async fn pinned_tls_ordered_drag_return_and_abrupt_disconnect() {
                 .await
                 .unwrap();
             let mut conn = Connection::new(tls);
-            for message in [
+            conn.send_batch(&[
                 Message::Enter { epoch: 1, y: 32768 },
                 Message::Key {
                     vk: 0xa2,
@@ -56,9 +56,9 @@ async fn pinned_tls_ordered_drag_return_and_abrupt_disconnect() {
                 },
                 Message::Move { dx: -20, dy: 5 },
                 Message::Move { dx: 21, dy: 0 },
-            ] {
-                conn.send(message).await.unwrap();
-            }
+            ])
+            .await
+            .unwrap();
             assert!(matches!(
                 conn.incoming.recv().await.unwrap().unwrap(),
                 Message::Return { epoch: 1, .. }
@@ -150,7 +150,10 @@ async fn cancellation_does_not_discard_partial_frame() {
 async fn partial_write_timeout_permanently_disables_writer() {
     let (host, _peer) = tokio::io::duplex(4);
     let mut conn = Connection::new(host);
-    let error = conn.send(Message::Heartbeat(9)).await.unwrap_err();
+    let error = conn
+        .send_batch(&[Message::Move { dx: -1, dy: 2 }, Message::ReleaseAll])
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     // A ReleaseAll after a partial frame would corrupt the remaining stream.
     let error = timeout(Duration::from_millis(20), conn.send(Message::ReleaseAll))
