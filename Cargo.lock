@@ -621,6 +621,7 @@ dependencies = [
  "shared",
  "tokio",
  "tokio-rustls",
+ "toml",
  "windows-sys 0.59.0",
 ]
 

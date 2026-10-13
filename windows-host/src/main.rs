@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod native;
 mod network;
+mod settings;
 mod shutdown;
 
 use anyhow::{bail, Context, Result};
@@ -46,6 +47,9 @@ fn pair(dir: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if settings::command(&args)? {
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("pair") {
         return pair(args.get(2).map(String::as_str).unwrap_or("certs"));
     }

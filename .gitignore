@@ -2,5 +2,6 @@
 /.tools/
 /certs/
 *.local.toml
+*.toml.pending
 *.log
 *-key.der
