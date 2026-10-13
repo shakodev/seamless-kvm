@@ -1,154 +1,249 @@
 # SeamlessKVM
 
-Windows 11 controls a native Rust macOS client over authenticated TLS. Move past Windows' left edge to enter the selected Mac display at its right edge; move right past that display's right edge to return. Quartz injects keyboard, mouse, dragging, and scrolling events in protocol order. The Stage 1 mock remains available for testing without injection. No video, clipboard, web UI, or background service.
+**One keyboard and mouse. Windows and Mac.**
 
-## Windows control panel
+SeamlessKVM lets you control a Mac with the keyboard and mouse connected to your Windows PC. Move across the screen edge to switch computers; move back to return. Input travels over an authenticated, encrypted connection on your local network.
 
-Double-click **SeamlessKVM.vbs** in the repository to open the desktop GUI. It compiles the small WPF launcher using Windows' included .NET Framework compiler on first launch and whenever its source changes. No terminal commands or extra GUI dependencies are required. After the first launch, you can also double-click `target/gui/SeamlessKVM.exe` or create a shortcut to it. Keep the executable inside this repository.
+```text
+        macOS client                       Windows host
+    +--------------------+             +--------------------+
+    |                    | <---------- |                    |
+    |        Mac         |  move left  |     Windows 11     |
+    |                    | ----------> |                    |
+    +--------------------+  move right +--------------------+
+                                         keyboard + mouse
+```
 
-1. Click **Build** to compile the Windows host. Rust and the C++ build tools below are still required; the GUI also detects this project's `.tools` toolchain.
-2. The existing `certs/host.local.toml` is selected automatically. Use **Browse** for another configuration, or **Create pairing…** and select a new empty folder.
-3. Choose the host's LAN **Listen address** and **Windows display**, then **Save**. A newly paired host uses loopback until changed. Copy only the generated `mock.local.toml` to the Mac as described below, and update its host address to match. The GUI does not change firewall rules.
-4. Click **Check** to validate native setup, then **Start server**. The status distinguishes listening from an authenticated connection. **Stop server** or closing the window restores local control and stops the host launched by that window.
+The current layout is fixed: **Mac on the left, Windows on the right.** Each computer uses its own display. SeamlessKVM shares input; it does not stream video, sync the clipboard, or transfer files.
 
-**Build** performs an incremental release build. **Rebuild** cleans the Windows host package and builds it again. Both stop this window's host first and leave it stopped; click Start when ready. The interface remains responsive and shows build errors in Activity. Closing during a build waits for that operation to finish.
+[Getting started](#getting-started) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
-GUI builds always use `target/gui-host/release/windows-host.exe`, separate from command-line and `mouse-optimized` builds. If an existing command-line host is running, the GUI displays **Already running**; stop that host normally before starting one here. The GUI does not take over or terminate hosts it did not start. Configuration paths inside TOML are resolved from the repository root. Saving updates the selected configuration, preserves credentials, and reformats TOML (comments are not retained).
+> **Early development.** Build from source and expect rough edges. Native input behavior needs testing on your own Windows and Mac setup; see the [hardware validation checklist](docs/STAGE2_VALIDATION.md).
 
-The control panel uses native Windows WPF controls in a separate process. It does not run input hooks. A private stdin pipe connects its lifetime to the Rust host: EOF after GUI exit/crash requests graceful shutdown, including session revocation, remote release, and input-thread teardown. The existing host crash watchdog remains active. The Activity log is bounded and never reads configuration contents or keystrokes.
+## Features
 
-## Build and pair
+- **Edge switching.** Cross the selected Windows display's left edge to enter the Mac at its right edge. Your cursor keeps its relative vertical position between different screen sizes.
+- **Keyboard and mouse forwarding.** Key repeats, left/right modifiers, five mouse buttons, dragging, and horizontal/vertical scrolling. Windows keys map to Command by default.
+- **Native input.** Rust with Win32 hooks and Raw Input on Windows, Quartz on macOS, and Tokio networking. Mouse movement is event-driven, with no smoothing timer or deliberate buffering delay.
+- **Windows control panel.** Build, pair, select a display, and start or stop the host from a native WPF window.
+- **Connection recovery.** The client reconnects after network loss. The host restores local control on disconnect or timeout, and a watchdog clears cursor confinement after a host crash or input-pump stall.
+- **Pinned TLS and pairing.** A certificate fingerprint identifies the host; a random pairing secret authenticates the client. Only one client is admitted at a time.
 
-Install stable Rust and the Visual Studio C++ build tools/Windows SDK (or Rust's Windows GNU toolchain plus a compatible MinGW-w64 compiler on PATH). From the repository root in PowerShell:
+**Emergency shortcut: `Ctrl+Alt+Shift+F12` restores Windows control and disconnects the session.**
+
+## Getting started
+
+### Requirements
+
+| Computer | Requirements |
+| --- | --- |
+| Windows host | Windows 11, a physical relative mouse, stable Rust, and Visual Studio C++ Build Tools with the Windows SDK. Rust's GNU toolchain with a compatible MinGW-w64 compiler is also supported. |
+| Mac client | An interactive, logged-in macOS desktop, stable Rust, and Apple's Command Line Tools (`xcode-select --install`). Build on the Mac for its architecture. |
+| Network | Both computers on the same LAN, with inbound TCP **24800** allowed on the Windows **Private** firewall profile. |
+
+Clone the repository on **both computers**:
+
+```sh
+git clone https://github.com/shakodev/seamless-kvm.git
+cd seamless-kvm
+```
+
+Run the commands below from the repository root. Paths inside host configuration files are resolved from the working directory, not from the TOML file's directory.
+
+### 1. Set up Windows
+
+Double-click **`SeamlessKVM.vbs`** to open the control panel. The launcher compiles itself on first use with Windows' included .NET Framework compiler; Rust and the C++ build tools are still needed to build the host.
+
+1. Click **Build**.
+2. Click **Create pairing…** and choose a new empty folder, such as `certs`. For an existing pairing, use **Browse…** to select `host.local.toml`.
+3. Set **Listen address** to your Windows LAN IP and port, for example `192.168.1.10:24800`. New pairings default to `127.0.0.1:24800`, which only accepts connections from the same computer.
+4. Select the **Windows display** whose left edge should switch to the Mac, then click **Save**.
+5. Click **Check** to verify native setup, then **Start server**.
+
+Allow inbound TCP 24800 through Windows Firewall on your Private network. The control panel does not change firewall rules.
+
+**Build** and **Rebuild** stop the host launched by that window and leave it stopped until you click **Start server** again. Closing the window also stops its host. Keep the launcher and generated executables inside the repository.
+
+<details>
+<summary>Set up Windows from the command line</summary>
+
+In PowerShell:
 
 ```powershell
-cargo build --release --workspace
+cargo build --release -p windows-host
 .\target\release\windows-host.exe pair certs
 .\target\release\windows-host.exe monitors
 ```
 
-Set `[monitor]` in `certs/host.local.toml` to the physical pixel bounds of the Windows monitor whose left edge should switch control. The host rejects bounds that do not match an actual monitor. `monitors` prints the required values, including negative desktop coordinates. Paths inside configurations are relative to the working directory. Example schemas are in `config/`.
+Edit `certs/host.local.toml`:
 
-The pairing command creates a self-signed certificate, PKCS#8 DER private key, random 256-bit secret, and matching host/mock configurations. It refuses to overwrite files. Keep the private key and both configurations private. Copy only `mock.local.toml` to the client through a trusted channel. The SHA-256 certificate pin is the trust anchor: TLS checks possession of its private key, without relying on CA, hostname, or expiration checks. Changing the certificate requires updating the pin. Regenerate in a new directory to rotate credentials.
+- Set `listen` to your Windows LAN IP and port.
+- Set `[monitor]` to the `left`, `top`, `width`, and `height` printed for your chosen display. These are physical desktop coordinates, which can be negative. The host rejects bounds that do not match an actual monitor.
 
-Switching direction is fixed to **Mac on the left of Windows**. After updating this version, rebuild and restart both endpoints; an older client still uses the opposite entry/return edges. Pairing credentials and monitor bounds do not need to change.
+Then check and start the host:
 
-## Build and run on macOS
-
-Use an interactive logged-in macOS desktop with stable Rust and Apple's command line tools (`xcode-select --install`). Build on the Mac for its architecture (Apple silicon or Intel); Windows builds do not produce a macOS executable:
-
-```sh
-cargo build --release -p macos-client
-./target/release/macos-client displays
+```powershell
+.\target\release\windows-host.exe check certs\host.local.toml
+.\target\release\windows-host.exe certs\host.local.toml
 ```
 
-Copy the generated `mock.local.toml` through a trusted channel to the Mac as `macos.local.toml`. It contains the pin and pairing secret; **never copy the host private key**. Set `host` to the Windows LAN IP, set the host's `listen` to that same IP, and permit TCP 24800 on the Windows Private firewall profile. Only one client can connect, so stop the mock before using the native client. Protect the Mac configuration with `chmod 600 macos.local.toml`.
+The `check` command sets up and tears down native input handling with input passing through. Stop a running command-line host before starting one in the GUI.
 
-The generated Stage 1 file works directly; native display discovery ignores its `screen_width`/`screen_height`. Optional native settings are shown in [config/macos.example.toml](config/macos.example.toml):
+</details>
 
-- `display_id`: an external display ID printed by `displays`. If it is absent/unavailable, built-in, or a mirror secondary, use the main display. IDs can change after reconnecting hardware or rebooting; run `displays` again if needed.
-- `win_to_command = true`: left/right Windows keys become left/right Command. Set false to ignore Windows keys. Ctrl remains Control; Alt becomes Option. Physical scan positions use the Mac's selected input layout, so select matching layouts for matching characters. AltGr arrives as Windows Ctrl+Alt, not macOS Option alone.
-- `pointer_speed = 1.0`: logical macOS display points per physical mouse count. Entry and return preserve normalized vertical position across resolutions. Retina backing pixels need no extra multiplier; adjust speed for comfort. The cursor stays within the selected display.
+### 2. Pair and build the Mac client
 
-Run the diagnostic once to request Accessibility permission:
+The Windows pairing step creates four files:
+
+| File | Purpose |
+| --- | --- |
+| `host-cert.der` | Host TLS certificate. |
+| `host-key.der` | Host private key. Keep it on Windows. |
+| `host.local.toml` | Windows configuration, including the pairing secret. |
+| `mock.local.toml` | Client configuration, including the certificate pin and pairing secret. Despite its name, the native Mac client accepts this file. |
+
+Copy **only `mock.local.toml`** to the Mac through a trusted channel and save it as `macos.local.toml` in the repository root. Change its `host` value to the Windows address you configured above:
+
+```toml
+host = "192.168.1.10:24800"
+```
+
+Keep the generated `certificate_sha256` and `pairing_secret` values intact. Then, on the Mac:
 
 ```sh
+chmod 600 macos.local.toml
+cargo build --release -p macos-client
+./target/release/macos-client displays
 ./target/release/macos-client check macos.local.toml
 ```
 
-If denied, the client exits before connecting. Follow the macOS prompt to **System Settings → Privacy & Security → Accessibility** (or the category named by your OS). Enable the launching terminal and/or client shown by macOS; add the client binary with the `+` button if needed. Restart the terminal/client and rerun `check`. Rebuilding or moving an unsigned binary may require granting permission again. `AXIsProcessTrustedWithOptions` checks authorization; the client never edits the permission database or bypasses security. The diagnostic enumerates displays and creates/destroys a Quartz source without injecting input or connecting to Windows. Screen Recording is not used.
+The diagnostic requests **Accessibility** permission. Open **System Settings → Privacy & Security → Accessibility** and enable the terminal and/or client shown by macOS. Add the client binary with the `+` button if needed. Restart the terminal or client, then run `check` again. Rebuilding or moving the unsigned binary may require granting permission again. Screen Recording permission is not used.
 
-Start the Windows host with its existing configuration, then on the Mac:
+### 3. Connect
+
+With the Windows server running, start the Mac client:
 
 ```sh
 ./target/release/macos-client macos.local.toml
 ```
 
-Wait for ready on both machines, then cross Windows' left edge. Held modifiers, keys, and buttons transfer with control; dragging continues inside the selected Mac display. The client releases held input on return, new entry, `ReleaseAll`, disconnect, heartbeat expiry, and graceful shutdown (Ctrl+C, SIGTERM, SIGHUP). It reconnects automatically after host/network failure or emergency disconnect, without replaying input. Permission revocation releases input best effort and exits with setup guidance. Display changes close the current session, release holds, then re-enumerate and reconnect using current bounds. No display polling or input hooks run on the Mac; permission checks share the 200 ms heartbeat timer.
+Wait for `Authenticated client ready` on Windows and `Connected and ready` on the Mac. Move past the selected Windows display's **left edge** to control the Mac. Move past the Mac display's **right edge** to return.
 
-## Mouse responsiveness
+Keys and buttons held during entry transfer to the Mac, so you can continue a drag there. On return, remote holds are released. Release and press any still-held keys or buttons again to use them on Windows. Dragging does not move files or windows between computers.
 
-Rebuild and restart both endpoints after updating the mouse optimizations. Stop the running Windows host before `cargo build --release -p windows-host` so Windows can replace its executable; on the Mac use `cargo build --release -p macos-client`. To build while the host is running, add `--target-dir target/mouse-optimized` and use that folder's `release/windows-host.exe` after stopping the old host. Existing pairing and `pointer_speed` settings still work; the wire format remains v1.
+Use **Stop server** in the control panel to end the session. For command-line processes, use `Ctrl+C` in their terminals when local control is available. The Mac client otherwise reconnects automatically, including after an emergency disconnect.
 
-Input is event-driven, with no smoothing timer or deliberate buffering delay. The host sends up to 32 already-queued events in one TLS write, explicitly flushes encrypted data to the transport, and skips stationary Raw Input reports. The Mac posts each movement individually in order; the earlier hover-coalescing change was removed after reports of cursor jumps. Fractional pointer speeds preserve relative movement totals instead of rounding every small delta independently. Periodic Accessibility checks run off the input executor, with one check in flight and a timeout, so a slow OS query does not pause mouse posting.
+## Configuration
 
-If using the separately built host, stop the old host first and launch this exact executable from the repository root with your existing configuration:
+Start from generated pairing files. The examples in [`config/`](config/) document the schema; their placeholder credentials cannot authenticate a connection.
 
-```powershell
-.\target\mouse-optimized\release\windows-host.exe certs\host.local.toml
-```
+Optional settings in `macos.local.toml`:
 
-Running `target/release/windows-host.exe` does **not** select the separately built update. Rebuild/restart the Mac client from the updated source too.
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `display_id` | Main display | Select an external display using an ID from `macos-client displays`. A missing, unavailable, built-in, or mirrored-secondary selection falls back to the main display. |
+| `win_to_command` | `true` | Map left/right Windows keys to left/right Command. Set `false` to ignore Windows keys. Ctrl remains Control; Alt becomes Option. |
+| `pointer_speed` | `1.0` | Logical macOS points per physical mouse count. Accepts `0.05`–`20.0`; Retina displays need no extra multiplier. |
+| `heartbeat_timeout_ms` | `2000` | Disconnect after this many milliseconds without receiving a message. Also configurable on the host. |
+| `reconnect_ms` | `1000` | Delay before the client retries a connection. |
 
-For the reported Ethernet-host / Wi-Fi-Mac setup, test the updated release builds at the existing 2000 Hz mouse setting first. If jitter remains, compare 1000 Hz with the same DPI and `pointer_speed`, then try Ethernet on the Mac if available to separate network effects from input processing. Keep other settings unchanged during each comparison. Automated tests do not establish a measured end-to-end latency or remove network delivery gaps. See the [mouse validation checklist](docs/STAGE2_VALIDATION.md#cursor-jump-correction-2026-10-13).
+The native client discovers display dimensions itself and ignores `screen_width` and `screen_height` in the generated mock configuration. The cursor stays within the selected Mac display. Mac display changes trigger a reconnect and display selection; Windows display changes require updating the host's monitor bounds and restarting it.
 
-## Mock test on one Windows machine
+Keyboard mapping follows physical key positions and the Mac's selected input layout. Use matching layouts for matching characters. AltGr arrives as Windows Ctrl+Alt, not as macOS Option alone.
 
-First check native API startup with input always passing through:
+## Security and limitations
 
-```powershell
-.\target\release\windows-host.exe check certs\host.local.toml
-```
+Pairing uses a self-signed certificate, a SHA-256 certificate pin, and a random 256-bit secret. The pin is the trust anchor; certificate authority, hostname, and expiry checks are not used. TLS still verifies possession of the host's private key. To rotate credentials, generate a pairing in a new directory and replace the configurations on both computers. Pairing refuses to overwrite existing files.
 
-Then run these commands in separate terminals:
+Keep the private key and both generated configurations private. Keystrokes and pairing secrets are not logged. Windows input is intercepted only while an authenticated client is ready and the network worker remains responsive. Disconnects, timeouts, a full input queue, or the emergency shortcut restore local control.
 
-```powershell
-.\target\release\windows-host.exe certs\host.local.toml
-.\target\release\mock-client.exe certs\mock.local.toml
-```
+Current limits:
 
-Wait for `Authenticated client ready`. Move past the configured monitor's left edge. The Windows cursor is confined to a pixel inside that edge; physical relative movement controls the mock's virtual cursor. Vertical entry/return positions scale between different screen heights. The mock starts at its right edge. Move right beyond that edge to return. The mock prints ownership changes and cursor coordinates once per second, never keys or credentials. Add `--auto-return` to the mock command to return automatically two seconds after each entry.
+- One Windows host, one Mac client, and a fixed Mac-on-the-left layout. There is no Linux endpoint or background service.
+- Windows elevated applications, UAC/secure desktops, absolute mouse devices, and applications reading their own Raw Input are outside the supported input-isolation behavior.
+- macOS login/lock screens, Secure Input, and applications that reject synthetic events can prevent input delivery. Simultaneous physical input on the Mac can interfere with cursor position and modifiers.
+- Common keyboard positions, F1–F20, navigation/keypad keys, and left/right modifiers are mapped. Media, vendor, Fn, menu, and F21–F24 keys are ignored. Lock states and keyboard LEDs are not synchronized.
+- The Mac releases held input on normal return, disconnect, timeout, and graceful shutdown. Force-killing the client or revoking Accessibility permission can prevent final releases; there is no Mac watchdog. Windows independently restores its own input on timeout.
 
-Keys, left/right modifiers, five mouse buttons, horizontal/vertical scrolling, and held-button dragging are forwarded in order. Held Windows keys/buttons receive local releases at entry and corresponding remote downs (modifiers first). At return or failure, remote holds are cleared. Release and press held keys/buttons again to use them locally after a normal return; old remote presses are not replayed into Windows applications. Dragging is simulated within the remote screen; this does not transfer windows, files, or desktop objects.
+## Troubleshooting
 
-**Emergency: Ctrl+Alt+Shift+F12 restores local control and disconnects the session.** Ctrl+C stops either program when local. The mock reconnects automatically after host restart, timeout, or emergency disconnection.
+| Problem | What to check |
+| --- | --- |
+| Mac keeps retrying | Both addresses must use the Windows LAN IP, not `127.0.0.1`. Check the port, firewall, matching pairing files, and that no mock or second client is connected. |
+| Connected, but no switch | Wait for the authenticated-ready status. Cross the selected Windows display's **left** edge. Recheck monitor bounds after changing Windows displays. |
+| Mac receives no input | Rerun `macos-client check macos.local.toml`, verify Accessibility permission, and restart the launching terminal/client. |
+| Wrong Mac display | Run `macos-client displays` again and update `display_id`. IDs can change after reconnecting a display or rebooting. |
+| Pointer feels too fast or slow | Adjust `pointer_speed`. For jitter, compare a lower mouse polling rate or a wired network connection while keeping other settings unchanged. |
+| GUI reports “Already running” | Stop the command-line host normally. The GUI does not take over or terminate a host it did not start. |
+| Build cannot replace an executable | Stop that host before rebuilding. GUI builds use `target/gui-host/release`; command-line builds use `target/release`. Start the executable you actually rebuilt. |
 
-For LAN testing, set host `listen` to its private LAN IP and mock `host` to that same address. Allow inbound TCP 24800 on the Windows **Private** firewall profile. The generated defaults bind loopback. Only one authenticated client is admitted; additional connections cannot replace it.
+When updating, rebuild and restart **both endpoints**. For input or connection problems, the [validation checklist](docs/STAGE2_VALIDATION.md) covers switching, permissions, held keys, and network failures.
 
-## Failure behavior and limits
+## Development
 
-- Suppression requires an authenticated, ready session and a fresh network-worker lease. No input event is silently dropped: a full 1,024-event queue revokes the session.
-- Heartbeats run every 200 ms. Default peer timeout is 2 seconds, writes time out after 500 ms, and a stalled network worker loses its local suppression lease after 750 ms. The input thread checks failures on events and a 20 ms timer.
-- Disconnect, malformed frames, invalid client messages, queue overflow, emergency, and shutdown restore local control. `ReleaseAll` is best effort over a usable connection; the mock also independently releases on disconnect/timeout. Stale return messages cannot end a newer switch.
-- A separate small watchdog process clears cursor confinement after host exit/crash or a 1-second input-pump stall. It revokes a stalled pump before it can resume interception. Windows removes hooks when their owner exits.
-- Use a physical relative mouse on the ordinary interactive desktop. Absolute mouse devices fail back to local control. Elevated windows, secure desktops/UAC, applications reading their own Raw Input, and other software that replaces global cursor confinement are outside Stage 1's isolation guarantees. Low-level hooks suppress legacy Windows input, not other applications' independently registered Raw Input.
-- Windows display topology is validated at startup; restart and update host bounds after changing Windows monitors. A second host or native diagnostic in the same Windows session is rejected. The Mac handles display changes by disconnecting and reselecting its display.
-- Quartz event posting has no delivery acknowledgement. Secure input, login/lock screens, permission revocation, and applications that reject synthetic events can prevent injection. Use one input source at a time: simultaneous physical Mac input can displace the cursor or interfere with modifiers. SIGKILL, process abort, power loss, or revoked permission can prevent final native releases; the Windows host still independently restores local control on timeout. This client does not install a Mac watchdog.
-- Standard ANSI/ISO scan positions, common JIS positions, F1–F20, navigation/keypad, and left/right modifiers are mapped. Pause/PrintScreen become F15/F13, ScrollLock becomes F14, NumLock becomes keypad Clear. Media/vendor/Fn/menu keys and F21–F24 are ignored. Caps Lock transitions during remote control are supported, but existing Windows/Mac lock states and LEDs are not synchronized by protocol v1. Double/triple clicks use a 500 ms, 4-point threshold. Mouse side-button actions depend on the Mac application.
+| Directory | Contents |
+| --- | --- |
+| [`shared/`](shared/) | Versioned wire protocol, pinned TLS, configuration, and switching state. |
+| [`windows-host/`](windows-host/) | Win32 hooks, Raw Input, host networking, and crash watchdog. |
+| [`macos-client/`](macos-client/) | Quartz injection, keyboard mapping, display selection, and reconnect loop. |
+| [`mock-client/`](mock-client/) | Simulated client for testing without native input injection. |
+| [`windows-gui/`](windows-gui/) | WPF control panel and GUI lifecycle tests. |
 
-## Checks
-
-```powershell
+```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Windows GUI checks (use Windows PowerShell):
+Tests cover framing, authentication, switching, event ordering, held-input cleanup, and connection failures. They do not replace physical testing on each OS. See the [protocol reference](docs/PROTOCOL.md) for wire details and invariants.
+
+<details>
+<summary>Test with the mock client on Windows</summary>
+
+Create pairing files and configure the Windows display as above. Keep both `listen` and `host` at `127.0.0.1:24800` for a single-machine test. Build the mock:
+
+```powershell
+cargo build --release -p mock-client
+```
+
+Start the Windows host, then run this in a separate terminal:
+
+```powershell
+.\target\release\mock-client.exe certs\mock.local.toml --auto-return
+```
+
+Wait for the authenticated-ready status, then cross the configured left edge. The mock simulates a remote cursor without injecting input and returns control after two seconds. Omit `--auto-return` to return by moving past its virtual right edge. Stop the mock before connecting the Mac; it occupies the single client slot.
+
+</details>
+
+<details>
+<summary>Native and GUI checks</summary>
+
+Compile and smoke-test the control panel from Windows PowerShell:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-gui/Launch.ps1 -BuildOnly
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-gui/Test.ps1
-# Optional native lifecycle check; stop all existing hosts first:
+```
+
+For the native host lifecycle check, stop all existing hosts first:
+
+```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-gui/Test-Host.ps1
 ```
 
-The GUI smoke test exercises real WPF controls with a harmless fixture process: argument quoting, settings, start/stop, rebuild, errors, recovery, and cleanup on close. The opt-in native check creates a fresh pairing identity, binds loopback port 0, and verifies managed shutdown on both EOF and a stop byte without an authenticated client. GUI/native test artifacts stay under `target/gui-tests/`.
+Type-check the macOS native wrapper from Windows without linking Apple frameworks:
 
-Tests cover framing, partial reads, pinning, pairing rejection, switching, drag state, abrupt disconnects, heartbeat expiry, extra-client rejection, stale sessions, and release behavior. `windows-host check` verifies actual Win32 setup/teardown while input passes through. Physical edge crossing, emergency keys, and mixed-DPI behavior still require interactive testing on the intended Windows desktop; automated checks do not certify those hardware paths. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the wire format and invariants.
+```sh
+cargo clippy -p macos-client --all-targets --features native-check -- -D warnings
+```
 
-The native client's tests additionally exercise scan/modifier mapping, negative display origins, scaling/clamping, ordered Quartz event descriptions, repeated keys, TLS entry/return and release on failure. Windows can type-check the isolated native Rust code with `cargo clippy -p macos-client --all-targets --features native-check -- -D warnings`; use this feature only for check/Clippy on non-macOS, since Apple frameworks cannot link there. On macOS, run the workspace checks above and the opt-in desktop diagnostic test:
+Use `native-check` only with check/Clippy on non-macOS systems. On a Mac with Accessibility permission, run the opt-in desktop setup test:
 
 ```sh
 cargo test -p macos-client native::tests::desktop_setup_and_teardown -- --ignored
 ```
 
-**Current validation:** Windows formatting, workspace Clippy, 50 Rust tests, GUI compilation/control tests, and the GUI's release host build passed. The GUI was rendered and visually checked on Windows. The new detached-process EOF test passed; the full native managed-host check was blocked by an already-running host, which was left undisturbed. The Win32 startup/teardown diagnostic and native-wrapper Clippy previously passed. A macOS build and actual Windows↔macOS latency/smoothness measurements have not been performed in this environment. Follow [docs/STAGE2_VALIDATION.md](docs/STAGE2_VALIDATION.md) on the intended machines before relying on native input behavior.
+</details>
 
-If using the workspace-local toolchain prepared during development, enable it for the current PowerShell session before running Cargo:
-
-```powershell
-$env:RUSTUP_HOME = "$PWD\.tools\rustup"
-$env:CARGO_HOME = "$PWD\.tools\cargo"
-$env:PATH = "$PWD\.tools\cargo\bin;$PWD\.tools\w64devkit\bin;$env:PATH"
-```
+Bug reports and focused pull requests are welcome. For input bugs, include OS versions, display layout/scaling, keyboard layout, and steps to reproduce. Include relevant tests for protocol, switching, or failure-handling changes, and state which OS you tested on. Keep pairing files and typed content out of reports.
