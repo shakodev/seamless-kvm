@@ -36,3 +36,22 @@ Build both binaries on their respective OS and follow README pairing/setup. Use 
 The user reported that basic Windows/Mac switching worked after correcting the Windows monitor bounds. That report does not establish every input/permission/failure test above. The new layout now exits Windows on the left, enters Mac on the right, and returns through the Mac's right edge. The right side of Windows and the left side of the Mac do not switch control.
 
 Added regression coverage checks authenticated left-edge entry, rejecting inward/stationary motion, a negative Windows monitor origin, Mac right-edge entry at three vertical positions, left-edge clamping, right-edge return with the current epoch, scaled dragging, and held-input release. Updated both TLS tests and the executable mock scenario for the mirrored layout. Windows formatting, workspace/native-wrapper Clippy, all 31 tests, and release Windows host/mock builds passed. Physical validation of this new direction still requires rebuilding and restarting the client on the Mac.
+
+## Mouse responsiveness update (2026-10-13)
+
+The user reports a Windows Ethernet host, a Mac on Wi-Fi, and a mouse currently polling at 2000 Hz (supports 125–8000 Hz). No packet timing or physical cursor measurements were available here. The update reduces per-event transport overhead and queued hover posting without adding a timer, changing the protocol, or interpolating future motion. Drag paths retain all movement samples.
+
+Windows validation passed: formatting, workspace Clippy with warnings denied, native-wrapper Clippy with `native-check`, all 44 automated tests, and release Windows host/mock builds. The running host locked the original release executable, so the updated binaries were built under `target/mouse-optimized/release/`; the running session was left in place. The Mac native framework code was type-checked only; no Mac build or live cursor benchmark was performed.
+
+Deterministic evidence, **not an end-to-end latency benchmark**:
+
+- A full 32-message batch produces identical ordered bytes with one underlying write instead of 32. Pinned TLS integration tests exercise batched entry, dragging, return, and disconnect cleanup.
+- Recorder tests apply 2,000 and 8,000 queued hover samples, flushing every 32: 63 and 250 motion posts respectively, with identical final position and total relative displacement to individual processing. These counts model queued bursts, not timed hardware polling.
+- Regression tests cover lone-sample delivery without another report, stationary suppression, fractional speeds (0.25, 0.5, 1.25), negative/positive origins, all input ordering barriers, every drag sample, per-sample clamping, return followed by a reversal, new entry, protocol failure during a burst, and cleanup after a pending motion post fails.
+
+On the intended desktops, rebuild/restart both release binaries and compare at the same DPI, display refresh rate, and `pointer_speed`:
+
+1. At 2000 Hz, test slow diagonal motion, small circles, rapid direction changes, and stopping precisely on small targets. Look for cursor stepping or trailing after stopping.
+2. Draw/drag curves with a held button, select text while holding Shift, click immediately after movement, and scroll while moving. Paths, modifiers, and click locations must remain correct.
+3. Test fractional pointer speed, display clamps, and a quick return-edge crossing followed by reversal; switching must still happen at the first crossing.
+4. Repeat at 1000 Hz, then compare a wired Mac connection if available. Record qualitative differences separately from any instrumented latency measurements. Repeat failure/emergency checks above while moving or dragging.
