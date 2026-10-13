@@ -92,6 +92,7 @@ pub async fn serve(
     bridge: Arc<Bridge>,
     mut input: mpsc::Receiver<InputPacket>,
     commands: SyncSender<Command>,
+    shutdown: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(shared::tls::server(
         &config.certificate,
@@ -104,7 +105,6 @@ pub async fn serve(
         "Host listening on {}; emergency: Ctrl+Alt+Shift+F12",
         config.listen
     );
-    let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut generation = 0u64;
     loop {

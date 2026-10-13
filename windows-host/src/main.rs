@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod native;
 mod network;
+mod shutdown;
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -70,26 +71,35 @@ fn main() -> Result<()> {
         shared::tls::server(&config.certificate, &config.private_key)?;
         return native::check(config.monitor.bounds());
     }
-    if args.len() != 2 {
+    let managed = args.get(1).map(String::as_str) == Some("--managed");
+    if args.len() != if managed { 3 } else { 2 } {
         bail!("usage: windows-host <host.local.toml> | pair [directory]");
     }
-    let config: shared::config::HostConfig = shared::config::load(&args[1])?;
+    let config: shared::config::HostConfig =
+        shared::config::load(&args[if managed { 2 } else { 1 }])?;
     config.validate()?;
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(run(config))
+        .block_on(run(config, managed))
 }
 
-async fn run(config: shared::config::HostConfig) -> Result<()> {
+async fn run(config: shared::config::HostConfig, managed: bool) -> Result<()> {
     #[cfg(windows)]
     {
         let bridge = std::sync::Arc::new(network::Bridge::new());
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let (commands, command_rx) = std::sync::mpsc::sync_channel(16);
         let input = native::start(config.monitor.bounds(), bridge.clone(), tx, command_rx)?;
-        let result = network::serve(config, bridge.clone(), rx, commands).await;
+        let result = network::serve(
+            config,
+            bridge.clone(),
+            rx,
+            commands,
+            shutdown::signal(managed),
+        )
+        .await;
         bridge
             .stop
             .store(true, std::sync::atomic::Ordering::Release);
@@ -103,7 +113,7 @@ async fn run(config: shared::config::HostConfig) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let _ = config;
+        let _ = (config, managed);
         bail!("Windows host requires Windows 11");
     }
 }
