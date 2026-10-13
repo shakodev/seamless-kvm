@@ -1,6 +1,6 @@
 # SeamlessKVM — Stage 2
 
-Windows 11 controls a native Rust macOS client over authenticated TLS. Move past Windows' right edge to enter the selected Mac display; move left past that display's left edge to return. Quartz injects keyboard, mouse, dragging, and scrolling events in protocol order. The Stage 1 mock remains available for testing without injection. No video, clipboard, web UI, or background service.
+Windows 11 controls a native Rust macOS client over authenticated TLS. Move past Windows' left edge to enter the selected Mac display at its right edge; move right past that display's right edge to return. Quartz injects keyboard, mouse, dragging, and scrolling events in protocol order. The Stage 1 mock remains available for testing without injection. No video, clipboard, web UI, or background service.
 
 ## Build and pair
 
@@ -12,9 +12,11 @@ cargo build --release --workspace
 .\target\release\windows-host.exe monitors
 ```
 
-Set `[monitor]` in `certs/host.local.toml` to the physical pixel bounds of the Windows monitor whose right edge should switch control. The host rejects bounds that do not match an actual monitor. `monitors` prints the required values, including negative desktop coordinates. Paths inside configurations are relative to the working directory. Example schemas are in `config/`.
+Set `[monitor]` in `certs/host.local.toml` to the physical pixel bounds of the Windows monitor whose left edge should switch control. The host rejects bounds that do not match an actual monitor. `monitors` prints the required values, including negative desktop coordinates. Paths inside configurations are relative to the working directory. Example schemas are in `config/`.
 
 The pairing command creates a self-signed certificate, PKCS#8 DER private key, random 256-bit secret, and matching host/mock configurations. It refuses to overwrite files. Keep the private key and both configurations private. Copy only `mock.local.toml` to the client through a trusted channel. The SHA-256 certificate pin is the trust anchor: TLS checks possession of its private key, without relying on CA, hostname, or expiration checks. Changing the certificate requires updating the pin. Regenerate in a new directory to rotate credentials.
+
+Switching direction is fixed to **Mac on the left of Windows**. After updating this version, rebuild and restart both endpoints; an older client still uses the opposite entry/return edges. Pairing credentials and monitor bounds do not need to change.
 
 ## Build and run on macOS
 
@@ -47,7 +49,7 @@ Start the Windows host with its existing configuration, then on the Mac:
 ./target/release/macos-client macos.local.toml
 ```
 
-Wait for ready on both machines, then cross Windows' right edge. Held modifiers, keys, and buttons transfer with control; dragging continues inside the selected Mac display. The client releases held input on return, new entry, `ReleaseAll`, disconnect, heartbeat expiry, and graceful shutdown (Ctrl+C, SIGTERM, SIGHUP). It reconnects automatically after host/network failure or emergency disconnect, without replaying input. Permission revocation releases input best effort and exits with setup guidance. Display changes close the current session, release holds, then re-enumerate and reconnect using current bounds. No display polling or input hooks run on the Mac; permission checks share the 200 ms heartbeat timer.
+Wait for ready on both machines, then cross Windows' left edge. Held modifiers, keys, and buttons transfer with control; dragging continues inside the selected Mac display. The client releases held input on return, new entry, `ReleaseAll`, disconnect, heartbeat expiry, and graceful shutdown (Ctrl+C, SIGTERM, SIGHUP). It reconnects automatically after host/network failure or emergency disconnect, without replaying input. Permission revocation releases input best effort and exits with setup guidance. Display changes close the current session, release holds, then re-enumerate and reconnect using current bounds. No display polling or input hooks run on the Mac; permission checks share the 200 ms heartbeat timer.
 
 ## Mock test on one Windows machine
 
@@ -64,7 +66,7 @@ Then run these commands in separate terminals:
 .\target\release\mock-client.exe certs\mock.local.toml
 ```
 
-Wait for `Authenticated client ready`. Move past the configured monitor's right edge. The Windows cursor is confined to a pixel inside that edge; physical relative movement controls the mock's virtual cursor. Vertical entry/return positions scale between different screen heights. Move left beyond the mock's x=0 to return. The mock prints ownership changes and cursor coordinates once per second, never keys or credentials. Add `--auto-return` to the mock command to return automatically two seconds after each entry.
+Wait for `Authenticated client ready`. Move past the configured monitor's left edge. The Windows cursor is confined to a pixel inside that edge; physical relative movement controls the mock's virtual cursor. Vertical entry/return positions scale between different screen heights. The mock starts at its right edge. Move right beyond that edge to return. The mock prints ownership changes and cursor coordinates once per second, never keys or credentials. Add `--auto-return` to the mock command to return automatically two seconds after each entry.
 
 Keys, left/right modifiers, five mouse buttons, horizontal/vertical scrolling, and held-button dragging are forwarded in order. Held Windows keys/buttons receive local releases at entry and corresponding remote downs (modifiers first). At return or failure, remote holds are cleared. Release and press held keys/buttons again to use them locally after a normal return; old remote presses are not replayed into Windows applications. Dragging is simulated within the remote screen; this does not transfer windows, files, or desktop objects.
 
@@ -99,7 +101,7 @@ The native client's tests additionally exercise scan/modifier mapping, negative 
 cargo test -p macos-client native::tests::desktop_setup_and_teardown -- --ignored
 ```
 
-**Current validation:** Windows formatting, Clippy, 29 automated tests, workspace development build, and the Win32 startup/teardown diagnostic passed. A macOS build and actual Windows↔macOS input validation have not been performed in this environment. Follow [docs/STAGE2_VALIDATION.md](docs/STAGE2_VALIDATION.md) on the intended machines before relying on native input behavior.
+**Current validation:** Windows formatting, Clippy, 31 automated tests, workspace development build, and the Win32 startup/teardown diagnostic passed. A macOS build and actual Windows↔macOS input validation have not been performed in this environment. Follow [docs/STAGE2_VALIDATION.md](docs/STAGE2_VALIDATION.md) on the intended machines before relying on native input behavior.
 
 If using the workspace-local toolchain prepared during development, enable it for the current PowerShell session before running Cargo:
 

@@ -18,7 +18,7 @@ Build both binaries on their respective OS and follow README pairing/setup. Use 
 | Permission denied | Run without Accessibility permission; clear setup message, no host-ready session, Windows remains usable | Pending Mac |
 | Permission granted | Grant through macOS settings, restart, run `check`; opt-in `desktop_setup_and_teardown` test completes without hanging | Pending Mac |
 | Display choice | Set external `display_id`; unplug it and verify fallback to main after reconnect; no ID uses main | Pending Mac |
-| Cursor switching | Enter near Windows top/middle/bottom; cursor appears on Mac's left edge at matching relative height. Move right then left past the edge; Windows resumes near its right edge at matching height | Pending both |
+| Cursor switching | Enter through Windows' left edge near top/middle/bottom; cursor appears on Mac's right edge at matching relative height. Move left then right past the edge; Windows resumes near its left edge at matching height | Pending both |
 | Resolution/scaling | Repeat with 4K/1080p, Retina scaled modes, negative monitor origins, and monitor above/below main. Check all four Mac bounds, fractional pointer speed, and repeat crossings | Pending both |
 | Keyboard | Letters/punctuation in matching layouts, both Shifts together and separate releases, both Ctrl/Alt/Win sides, Win+A/Win+C/Win+V, arrows, Home/End, keypad Enter/divide and repeated keys. `win_to_command=false` ignores Win | Pending both |
 | Mouse | All five buttons, right-click, double/triple-click, held-button entry and dragging, vertical/horizontal wheel in both directions and partial detents | Pending both |
@@ -30,3 +30,9 @@ Build both binaries on their respective OS and follow README pairing/setup. Use 
 | Permission revoked | Disable Accessibility while remote; client stops and Windows resumes. macOS may reject final releases after revocation; physically reset any affected Mac keys/buttons | Pending both |
 
 `CGEventPost` provides no delivery result, so visible application behavior must be checked. A headless macOS CI build or event recorder cannot substitute for these rows. Force-killing the Mac process cannot run its cleanup; the host's independent timeout still restores Windows input. Lock states/LEDs, media/vendor keys, and secure input limitations are listed in README.
+
+## Left-side layout update (2026-10-13)
+
+The user reported that basic Windows/Mac switching worked after correcting the Windows monitor bounds. That report does not establish every input/permission/failure test above. The new layout now exits Windows on the left, enters Mac on the right, and returns through the Mac's right edge. The right side of Windows and the left side of the Mac do not switch control.
+
+Added regression coverage checks authenticated left-edge entry, rejecting inward/stationary motion, a negative Windows monitor origin, Mac right-edge entry at three vertical positions, left-edge clamping, right-edge return with the current epoch, scaled dragging, and held-input release. Updated both TLS tests and the executable mock scenario for the mirrored layout. Windows formatting, workspace/native-wrapper Clippy, all 31 tests, and release Windows host/mock builds passed. Physical validation of this new direction still requires rebuilding and restarting the client on the Mac.
