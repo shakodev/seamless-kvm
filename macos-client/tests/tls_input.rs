@@ -72,7 +72,7 @@ async fn host_protocol_drives_native_engine_and_releases_after_tls_loss() {
                     left: 0, top: 0, width: 3840, height: 2160 }).await.unwrap();
                 assert_eq!((bounds.left, bounds.top, bounds.width, bounds.height), (0, 0, 1280, 720));
                 let mut conn = Connection::new(tls);
-                for message in [
+                conn.send_batch(&[
                     Message::Enter { epoch, y: 32768 },
                     Message::Key { vk: 0x5b, scan: 0x5b, extended: true, down: true },
                     Message::Key { vk: 65, scan: 0x1e, extended: false, down: true },
@@ -81,7 +81,7 @@ async fn host_protocol_drives_native_engine_and_releases_after_tls_loss() {
                     Message::Scroll { horizontal: false, delta: 120 },
                     Message::Move { dx: -12, dy: 0 },
                     Message::Move { dx: 13, dy: 0 },
-                ] { conn.send(message).await.unwrap(); }
+                ]).await.unwrap();
                 loop {
                     match conn.incoming.recv().await.unwrap().unwrap() {
                         Message::Return { epoch: returned, y } => {
