@@ -39,6 +39,8 @@ Added regression coverage checks authenticated left-edge entry, rejecting inward
 
 ## Mouse responsiveness update (2026-10-13)
 
+**Superseded attempt:** the user subsequently reported worse motion with multiple jumps per second. The counts below measured reduced work, not visual smoothness. See the correction below; hover coalescing is no longer enabled.
+
 The user reports a Windows Ethernet host, a Mac on Wi-Fi, and a mouse currently polling at 2000 Hz (supports 125–8000 Hz). No packet timing or physical cursor measurements were available here. The update reduces per-event transport overhead and queued hover posting without adding a timer, changing the protocol, or interpolating future motion. Drag paths retain all movement samples.
 
 Windows validation passed: formatting, workspace Clippy with warnings denied, native-wrapper Clippy with `native-check`, all 44 automated tests, and release Windows host/mock builds. The running host locked the original release executable, so the updated binaries were built under `target/mouse-optimized/release/`; the running session was left in place. The Mac native framework code was type-checked only; no Mac build or live cursor benchmark was performed.
@@ -55,3 +57,20 @@ On the intended desktops, rebuild/restart both release binaries and compare at t
 2. Draw/drag curves with a held button, select text while holding Shift, click immediately after movement, and scroll while moving. Paths, modifiers, and click locations must remain correct.
 3. Test fractional pointer speed, display clamps, and a quick return-edge crossing followed by reversal; switching must still happen at the first crossing.
 4. Repeat at 1000 Hz, then compare a wired Mac connection if available. Record qualitative differences separately from any instrumented latency measurements. Repeat failure/emergency checks above while moving or dragging.
+
+## Cursor jump correction (2026-10-13)
+
+The user rebuilt the Mac client but was unsure which Windows executable was active. Process inspection confirmed `target/release/windows-host.exe` was running; the previous Windows update had been built separately under `target/mouse-optimized/release/`. The running host was left in place. The corrected binaries are again in the separate folder, with an explicit launch command in README.
+
+Removed Mac hover coalescing and restored individual event posting, retaining fractional-delta correction and stationary-event suppression. Fixed missing TLS flushes in both ready-session and handshake writes. The [tokio-rustls contract](https://docs.rs/tokio-rustls/latest/tokio_rustls/#why-do-i-need-to-call-poll_flush) allows a successful write to leave encrypted data buffered after transport backpressure; a later read does not flush it. Write and flush now share the deadline, and cancellation/failure disables further writes on that connection.
+
+Moved the synchronous 200 ms Accessibility check off the Mac input executor. Only one check is allowed in flight per session; failures and stalled checks still release held inputs and close the session. Actual macOS permission-query duration has not been measured here, so this removes a possible periodic stall rather than proving its role in the reported jumps.
+
+Windows verification: formatting, workspace/native-wrapper Clippy, all 45 tests, and optimized Windows host/mock builds passed. New evidence includes:
+
+- A real pinned-TLS test blocks encrypted writes after the handshake. It **failed before** the fix because send completed while bytes remained buffered, then **passed after** the fix. The final movement arrives after transport recovery without any subsequent message/heartbeat.
+- Buffered handshake messages complete without deadlock. Flush errors, flush timeouts, and cancellation all prevent further writes.
+- A queued 40-report cursor burst produces 40 individual movement posts, with ordered coordinates and held-key release on protocol failure.
+- A forced blocking permission check allows mouse posting before the check completes. A stuck check ends the session despite healthy peer heartbeats, clears holds, and does not launch additional overlapping checks.
+
+These tests verify the reproduced transport bug and scheduling behavior, not physical Mac cursor smoothness. Restart both corrected endpoints and repeat the movement/drag/stop checks above at the same 2000 Hz setting first. Record whether the repeated jumps remain; do not infer end-to-end latency from synthetic tests.

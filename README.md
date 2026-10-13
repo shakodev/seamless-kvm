@@ -55,9 +55,17 @@ Wait for ready on both machines, then cross Windows' left edge. Held modifiers, 
 
 Rebuild and restart both endpoints after updating the mouse optimizations. Stop the running Windows host before `cargo build --release -p windows-host` so Windows can replace its executable; on the Mac use `cargo build --release -p macos-client`. To build while the host is running, add `--target-dir target/mouse-optimized` and use that folder's `release/windows-host.exe` after stopping the old host. Existing pairing and `pointer_speed` settings still work; the wire format remains v1.
 
-Input is event-driven, with no smoothing timer or deliberate buffering delay. The host sends up to 32 already-queued events in one TLS write and skips stationary Raw Input reports. The Mac catches up on bursts by coalescing consecutive cursor-only movements already available, while still applying each sample's bounds and return-edge checks. Keys, clicks, scrolling, and ownership changes flush pending motion; dragging retains every movement sample so drawing/selection paths remain intact. Fractional pointer speeds preserve relative movement totals instead of rounding every small delta independently.
+Input is event-driven, with no smoothing timer or deliberate buffering delay. The host sends up to 32 already-queued events in one TLS write, explicitly flushes encrypted data to the transport, and skips stationary Raw Input reports. The Mac posts each movement individually in order; the earlier hover-coalescing change was removed after reports of cursor jumps. Fractional pointer speeds preserve relative movement totals instead of rounding every small delta independently. Periodic Accessibility checks run off the input executor, with one check in flight and a timeout, so a slow OS query does not pause mouse posting.
 
-For the reported Ethernet-host / Wi-Fi-Mac setup, test the updated release builds at the existing 2000 Hz mouse setting first. If jitter remains, compare 1000 Hz with the same DPI and `pointer_speed`, then try Ethernet on the Mac if available to separate network effects from input processing. Keep other settings unchanged during each comparison. These optimizations reduce redundant work; they do not establish a measured end-to-end latency or remove network delivery gaps. See the [mouse validation checklist](docs/STAGE2_VALIDATION.md#mouse-responsiveness-update-2026-10-13).
+If using the separately built host, stop the old host first and launch this exact executable from the repository root with your existing configuration:
+
+```powershell
+.\target\mouse-optimized\release\windows-host.exe certs\host.local.toml
+```
+
+Running `target/release/windows-host.exe` does **not** select the separately built update. Rebuild/restart the Mac client from the updated source too.
+
+For the reported Ethernet-host / Wi-Fi-Mac setup, test the updated release builds at the existing 2000 Hz mouse setting first. If jitter remains, compare 1000 Hz with the same DPI and `pointer_speed`, then try Ethernet on the Mac if available to separate network effects from input processing. Keep other settings unchanged during each comparison. Automated tests do not establish a measured end-to-end latency or remove network delivery gaps. See the [mouse validation checklist](docs/STAGE2_VALIDATION.md#cursor-jump-correction-2026-10-13).
 
 ## Mock test on one Windows machine
 
@@ -109,7 +117,7 @@ The native client's tests additionally exercise scan/modifier mapping, negative 
 cargo test -p macos-client native::tests::desktop_setup_and_teardown -- --ignored
 ```
 
-**Current validation:** Windows formatting, workspace and native-wrapper Clippy, 44 automated tests, and release Windows host/mock builds passed. The Win32 startup/teardown diagnostic previously passed. A macOS build and actual Windows↔macOS latency/smoothness measurements have not been performed in this environment. Follow [docs/STAGE2_VALIDATION.md](docs/STAGE2_VALIDATION.md) on the intended machines before relying on native input behavior.
+**Current validation:** Windows formatting, workspace and native-wrapper Clippy, 45 automated tests, and release Windows host/mock builds passed. The Win32 startup/teardown diagnostic previously passed. A macOS build and actual Windows↔macOS latency/smoothness measurements have not been performed in this environment. Follow [docs/STAGE2_VALIDATION.md](docs/STAGE2_VALIDATION.md) on the intended machines before relying on native input behavior.
 
 If using the workspace-local toolchain prepared during development, enable it for the current PowerShell session before running Cargo:
 
