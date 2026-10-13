@@ -1,6 +1,21 @@
-# SeamlessKVM — Stage 2
+# SeamlessKVM
 
 Windows 11 controls a native Rust macOS client over authenticated TLS. Move past Windows' left edge to enter the selected Mac display at its right edge; move right past that display's right edge to return. Quartz injects keyboard, mouse, dragging, and scrolling events in protocol order. The Stage 1 mock remains available for testing without injection. No video, clipboard, web UI, or background service.
+
+## Windows control panel
+
+Double-click **SeamlessKVM.vbs** in the repository to open the desktop GUI. It compiles the small WPF launcher using Windows' included .NET Framework compiler on first launch and whenever its source changes. No terminal commands or extra GUI dependencies are required. After the first launch, you can also double-click `target/gui/SeamlessKVM.exe` or create a shortcut to it. Keep the executable inside this repository.
+
+1. Click **Build** to compile the Windows host. Rust and the C++ build tools below are still required; the GUI also detects this project's `.tools` toolchain.
+2. The existing `certs/host.local.toml` is selected automatically. Use **Browse** for another configuration, or **Create pairing…** and select a new empty folder.
+3. Choose the host's LAN **Listen address** and **Windows display**, then **Save**. A newly paired host uses loopback until changed. Copy only the generated `mock.local.toml` to the Mac as described below, and update its host address to match. The GUI does not change firewall rules.
+4. Click **Check** to validate native setup, then **Start server**. The status distinguishes listening from an authenticated connection. **Stop server** or closing the window restores local control and stops the host launched by that window.
+
+**Build** performs an incremental release build. **Rebuild** cleans the Windows host package and builds it again. Both stop this window's host first and leave it stopped; click Start when ready. The interface remains responsive and shows build errors in Activity. Closing during a build waits for that operation to finish.
+
+GUI builds always use `target/gui-host/release/windows-host.exe`, separate from command-line and `mouse-optimized` builds. If an existing command-line host is running, the GUI displays **Already running**; stop that host normally before starting one here. The GUI does not take over or terminate hosts it did not start. Configuration paths inside TOML are resolved from the repository root. Saving updates the selected configuration, preserves credentials, and reformats TOML (comments are not retained).
+
+The control panel uses native Windows WPF controls in a separate process. It does not run input hooks. A private stdin pipe connects its lifetime to the Rust host: EOF after GUI exit/crash requests graceful shutdown, including session revocation, remote release, and input-thread teardown. The existing host crash watchdog remains active. The Activity log is bounded and never reads configuration contents or keystrokes.
 
 ## Build and pair
 
@@ -109,6 +124,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Windows GUI checks (use Windows PowerShell):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-gui/Launch.ps1 -BuildOnly
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-gui/Test.ps1
+# Optional native lifecycle check; stop all existing hosts first:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-gui/Test-Host.ps1
+```
+
+The GUI smoke test exercises real WPF controls with a harmless fixture process: argument quoting, settings, start/stop, rebuild, errors, recovery, and cleanup on close. The opt-in native check creates a fresh pairing identity, binds loopback port 0, and verifies managed shutdown on both EOF and a stop byte without an authenticated client. GUI/native test artifacts stay under `target/gui-tests/`.
+
 Tests cover framing, partial reads, pinning, pairing rejection, switching, drag state, abrupt disconnects, heartbeat expiry, extra-client rejection, stale sessions, and release behavior. `windows-host check` verifies actual Win32 setup/teardown while input passes through. Physical edge crossing, emergency keys, and mixed-DPI behavior still require interactive testing on the intended Windows desktop; automated checks do not certify those hardware paths. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the wire format and invariants.
 
 The native client's tests additionally exercise scan/modifier mapping, negative display origins, scaling/clamping, ordered Quartz event descriptions, repeated keys, TLS entry/return and release on failure. Windows can type-check the isolated native Rust code with `cargo clippy -p macos-client --all-targets --features native-check -- -D warnings`; use this feature only for check/Clippy on non-macOS, since Apple frameworks cannot link there. On macOS, run the workspace checks above and the opt-in desktop diagnostic test:
@@ -117,7 +143,7 @@ The native client's tests additionally exercise scan/modifier mapping, negative 
 cargo test -p macos-client native::tests::desktop_setup_and_teardown -- --ignored
 ```
 
-**Current validation:** Windows formatting, workspace and native-wrapper Clippy, 45 automated tests, and release Windows host/mock builds passed. The Win32 startup/teardown diagnostic previously passed. A macOS build and actual Windows↔macOS latency/smoothness measurements have not been performed in this environment. Follow [docs/STAGE2_VALIDATION.md](docs/STAGE2_VALIDATION.md) on the intended machines before relying on native input behavior.
+**Current validation:** Windows formatting, workspace Clippy, 50 Rust tests, GUI compilation/control tests, and the GUI's release host build passed. The GUI was rendered and visually checked on Windows. The new detached-process EOF test passed; the full native managed-host check was blocked by an already-running host, which was left undisturbed. The Win32 startup/teardown diagnostic and native-wrapper Clippy previously passed. A macOS build and actual Windows↔macOS latency/smoothness measurements have not been performed in this environment. Follow [docs/STAGE2_VALIDATION.md](docs/STAGE2_VALIDATION.md) on the intended machines before relying on native input behavior.
 
 If using the workspace-local toolchain prepared during development, enable it for the current PowerShell session before running Cargo:
 
