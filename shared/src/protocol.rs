@@ -205,7 +205,10 @@ pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Message
 pub async fn write_message<W: AsyncWrite + Unpin>(w: &mut W, m: Message) -> io::Result<()> {
     let mut buf = [0; HEADER_LEN + MAX_PAYLOAD];
     let n = m.encode(&mut buf);
-    w.write_all(&buf[..n]).await
+    w.write_all(&buf[..n]).await?;
+    // Handshake messages also use buffered TLS streams and must reach the
+    // transport before waiting for the peer's next handshake response.
+    w.flush().await
 }
 
 #[cfg(test)]

@@ -120,11 +120,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Connection<S> {
                 .unwrap();
             len += message.encode(frame);
         }
-        let result = timeout(WRITE_TIMEOUT, self.writer.write_all(&bytes[..len]))
-            .await
-            .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout")));
-        if result.is_err() {
-            self.write_failed = true;
+        // rustls can accept plaintext while encrypted bytes remain buffered.
+        // Flush before reporting success, under the same deadline as the write.
+        // Mark unusable before awaiting so cancellation cannot append a release
+        // to a partially written frame or an unflushed TLS record.
+        self.write_failed = true;
+        let result = timeout(WRITE_TIMEOUT, async {
+            self.writer.write_all(&bytes[..len]).await?;
+            self.writer.flush().await
+        })
+        .await
+        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout")));
+        if result.is_ok() {
+            self.write_failed = false;
         }
         result
     }
@@ -149,6 +157,9 @@ mod tests {
     struct Writes {
         bytes: Vec<u8>,
         calls: usize,
+        flushes: usize,
+        block_flush: bool,
+        fail_flush: bool,
     }
     struct RecordingStream(Arc<Mutex<Writes>>);
     impl AsyncRead for RecordingStream {
@@ -172,7 +183,15 @@ mod tests {
             Poll::Ready(Ok(bytes.len()))
         }
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            let mut writes = self.0.lock().unwrap();
+            writes.flushes += 1;
+            if writes.block_flush {
+                Poll::Pending
+            } else if writes.fail_flush {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
@@ -205,9 +224,11 @@ mod tests {
         }
         let single = std::mem::take(&mut *writes.lock().unwrap());
         assert_eq!(single.calls, MAX_BATCH_MESSAGES);
+        assert_eq!(single.flushes, MAX_BATCH_MESSAGES);
         conn.send_batch(&messages).await.unwrap();
         let batched = std::mem::take(&mut *writes.lock().unwrap());
         assert_eq!(batched.calls, 1);
+        assert_eq!(batched.flushes, 1);
         assert_eq!(batched.bytes, single.bytes);
         let mut bytes = batched.bytes.as_slice();
         for message in messages {
@@ -229,5 +250,60 @@ mod tests {
         assert_eq!(writes.lock().unwrap().calls, 0);
         conn.send(Message::ReleaseAll).await.unwrap();
         assert_eq!(writes.lock().unwrap().calls, 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_flush_times_out_and_permanently_disables_writer() {
+        let writes = Arc::new(Mutex::new(Writes {
+            block_flush: true,
+            ..Writes::default()
+        }));
+        let mut conn = Connection::new(RecordingStream(writes));
+        let error = conn
+            .send(Message::Move { dx: -1, dy: 2 })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            conn.send(Message::ReleaseAll).await.unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_cannot_be_followed_by_another_frame() {
+        let writes = Arc::new(Mutex::new(Writes {
+            block_flush: true,
+            ..Writes::default()
+        }));
+        let mut conn = Connection::new(RecordingStream(writes.clone()));
+        assert!(
+            timeout(Duration::from_millis(20), conn.send(Message::ReleaseAll))
+                .await
+                .is_err()
+        );
+        writes.lock().unwrap().block_flush = false;
+        assert_eq!(
+            conn.send(Message::ReleaseAll).await.unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert_eq!(writes.lock().unwrap().calls, 1);
+    }
+
+    #[tokio::test]
+    async fn flush_error_is_a_connection_failure() {
+        let writes = Arc::new(Mutex::new(Writes {
+            fail_flush: true,
+            ..Writes::default()
+        }));
+        let mut conn = Connection::new(RecordingStream(writes));
+        assert_eq!(
+            conn.send(Message::ReleaseAll).await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            conn.send(Message::ReleaseAll).await.unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
     }
 }

@@ -162,3 +162,114 @@ async fn partial_write_timeout_permanently_disables_writer() {
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
 }
+
+/// Suspend the underlying transport after TLS handshaking. Unlike an in-memory
+/// recorder, real rustls can accept plaintext while its encrypted write blocks.
+#[derive(Default)]
+struct WriteGate {
+    blocked: std::sync::atomic::AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+impl WriteGate {
+    fn open(&self) {
+        self.blocked
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+struct GatedStream {
+    stream: tokio::io::DuplexStream,
+    gate: std::sync::Arc<WriteGate>,
+}
+impl tokio::io::AsyncRead for GatedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for GatedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        {
+            let mut waker = self.gate.waker.lock().unwrap();
+            if self.gate.blocked.load(std::sync::atomic::Ordering::Acquire) {
+                *waker = Some(cx.waker().clone());
+                return std::task::Poll::Pending;
+            }
+        }
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, bytes)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn final_movement_flushes_after_tls_backpressure_without_another_message() {
+    timeout(Duration::from_secs(2), async {
+        let (cert, key, pin) = identity();
+        let (host, peer) = tokio::io::duplex(4096);
+        let gate = std::sync::Arc::new(WriteGate::default());
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls::server_der(cert, key).unwrap());
+        let connector = tokio_rustls::TlsConnector::from(tls::client(pin));
+        let (host, peer) = tokio::join!(
+            acceptor.accept(GatedStream {
+                stream: host,
+                gate: gate.clone()
+            }),
+            connector.connect("seamlesskvm.local".try_into().unwrap(), peer)
+        );
+        let mut conn = Connection::new(host.unwrap());
+        let mut peer = Connection::new(peer.unwrap());
+        gate.blocked
+            .store(true, std::sync::atomic::Ordering::Release);
+        let message = Message::Move { dx: -1, dy: 2 };
+        {
+            let send = conn.send(message);
+            tokio::pin!(send);
+            // send must not report success with encrypted bytes still buffered.
+            assert!(timeout(Duration::from_millis(20), &mut send).await.is_err());
+            gate.open();
+            send.await.unwrap();
+        }
+        // No later input/heartbeat is sent to accidentally flush the last move.
+        assert!(peer.incoming.recv().await.unwrap().unwrap() == message);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn handshake_flushes_each_buffered_message() {
+    let (host, peer) = tokio::io::duplex(4096);
+    // Force every small write to buffer even on a fast loopback connection.
+    let mut host = tokio::io::BufStream::new(host);
+    let mut peer = tokio::io::BufStream::new(peer);
+    let (host, peer) = timeout(Duration::from_secs(1), async {
+        tokio::join!(
+            connection::host_handshake(&mut host, [7; 32], bounds()),
+            connection::client_handshake(&mut peer, [7; 32], bounds())
+        )
+    })
+    .await
+    .expect("handshake messages remained buffered");
+    assert!(host.is_ok());
+    assert!(peer.is_ok());
+}
